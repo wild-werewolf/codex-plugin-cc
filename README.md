@@ -72,6 +72,33 @@ One simple first run is:
 /codex:result
 ```
 
+### Installing this fork (`wild-codex`)
+
+This fork adds approval handling (`--approvals`, `/codex:approve`) on top of the upstream plugin. Its marketplace is named `wild-codex` so it does not clash with `openai-codex`; the plugin itself is still called `codex`, so only one of the two should be enabled at a time:
+
+```bash
+/plugin marketplace add wild-werewolf/codex-plugin-cc
+/plugin disable codex@openai-codex
+/plugin install codex@wild-codex
+/reload-plugins
+```
+
+Skip the `disable` step if the upstream plugin was never installed. To go back, run `/plugin disable codex@wild-codex` and `/plugin enable codex@openai-codex`.
+
+#### Pulling in upstream changes
+
+```bash
+git remote add upstream https://github.com/openai/codex-plugin-cc.git   # once
+git fetch upstream
+git checkout approvals
+git rebase upstream/main
+npm test
+node plugins/codex/scripts/codex-companion.mjs protocol-check
+git push --force-with-lease origin approvals
+```
+
+Resolve conflicts in favor of the approval handling (no `approvalPolicy: "never"`, no session-wide grants). If upstream bumped its version, set the fork version to match, for example `node scripts/bump-version.mjs 1.0.7-approvals.1`, and check it with `npm run check-version`. `protocol-check` needs the Codex CLI on `PATH` and should report `compatible`; re-run it whenever Codex itself is updated. After the change lands on the fork's `main`, refresh the plugin with `/plugin marketplace update wild-codex`.
+
 ## Usage
 
 ### `/codex:review`
