@@ -116,6 +116,41 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
+const SANDBOX_TYPES = { "read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess" };
+
+// Thread permissions as the real app-server reports them: the requested
+// sandbox, the config approval policy when none is sent, the "user" reviewer.
+function buildPermissionResult(params) {
+  const type = BEHAVIOR === "sandbox-escalated" ? "dangerFullAccess" : SANDBOX_TYPES[params.sandbox || "read-only"];
+  return {
+    approvalPolicy: params.approvalPolicy || "on-request",
+    approvalsReviewer: params.approvalsReviewer || "user",
+    sandbox: { type, networkAccess: false }
+  };
+}
+
+const pendingServerRequests = new Map();
+let nextServerRequestId = 1;
+
+// Send a server request and resolve with the client's response.
+function requestFromClient(method, params) {
+  const id = "srv_" + nextServerRequestId++;
+  return new Promise((resolve) => {
+    pendingServerRequests.set(id, resolve);
+    send({ id, method, params });
+  });
+}
+
+function approvalDecisionText(response) {
+  if (!response) {
+    return "none";
+  }
+  if (response.error) {
+    return "error:" + response.error.code;
+  }
+  return JSON.stringify(response.result && response.result.decision);
+}
+
 function nextThread(state, cwd, ephemeral) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
@@ -281,6 +316,14 @@ rl.on("line", (line) => {
   }
 
   const message = JSON.parse(line);
+  if (message.method === undefined && message.id !== undefined) {
+    const resolveResponse = pendingServerRequests.get(message.id);
+    if (resolveResponse) {
+      pendingServerRequests.delete(message.id);
+      resolveResponse(message);
+    }
+    return;
+  }
   const state = loadState();
 
   try {
@@ -313,7 +356,9 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        state.lastThreadStart = message.params;
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, ...buildPermissionResult(message.params), reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +391,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = message.params;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, ...buildPermissionResult(message.params), reasoningEffort: null } });
         break;
       }
 
@@ -449,10 +495,36 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          approvalPolicy: message.params.approvalPolicy ?? null,
+	          approvalsReviewer: message.params.approvalsReviewer ?? null,
+	          sandboxPolicy: message.params.sandboxPolicy ?? null,
 	          prompt
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+
+	        if (BEHAVIOR === "approval-command") {
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          requestFromClient("item/commandExecution/requestApproval", {
+	            kind: "command",
+	            threadId: thread.id,
+	            turnId,
+	            itemId: "cmd_" + turnId,
+	            startedAtMs: Date.now(),
+	            environmentId: null,
+	            command: "npm install left-pad",
+	            cwd: thread.cwd,
+	            reason: "needs network access"
+	          }).then((response) => {
+	            const latest = loadState();
+	            latest.approvalResponses = [...(latest.approvalResponses || []), response];
+	            saveState(latest);
+	            const text = "Approval decision: " + approvalDecisionText(response);
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text, phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          });
+	          break;
+	        }
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

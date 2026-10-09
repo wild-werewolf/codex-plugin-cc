@@ -12,6 +12,7 @@ import net from "node:net";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import readline from "node:readline";
+import { failClosedServerRequestResult } from "./approvals.mjs";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
@@ -65,6 +66,7 @@ class AppServerClientBase {
     this.exitError = null;
     /** @type {AppServerNotificationHandler | null} */
     this.notificationHandler = null;
+    this.serverRequestHandler = null;
     this.lineBuffer = "";
     this.transport = "unknown";
 
@@ -75,6 +77,15 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  /**
+   * Install the handler for server-initiated requests (approvals, elicitation).
+   * It may be async; an optional `handler.onResolved(params)` hears
+   * `serverRequest/resolved` for requests the server closed on its own.
+   */
+  setServerRequestHandler(handler) {
+    this.serverRequestHandler = handler ?? null;
   }
 
   /**
@@ -148,16 +159,36 @@ class AppServerClientBase {
       return;
     }
 
+    if (message.method === "serverRequest/resolved") {
+      this.serverRequestHandler?.onResolved?.(message.params);
+    }
+
     if (message.method && this.notificationHandler) {
       this.notificationHandler(/** @type {AppServerNotification} */ (message));
     }
   }
 
   handleServerRequest(message) {
-    this.sendMessage({
-      id: message.id,
-      error: buildJsonRpcError(-32601, `Unsupported server request: ${message.method}`)
-    });
+    // Without a handler, approval requests are declined (fail-closed) rather
+    // than answered "unsupported", which Codex treats as a broken turn.
+    const handler = this.serverRequestHandler ?? failClosedServerRequestResult;
+    Promise.resolve()
+      .then(() => handler(message))
+      .then(
+        (result) => {
+          if (!this.closed) {
+            this.sendMessage({ id: message.id, result: result ?? {} });
+          }
+        },
+        (error) => {
+          if (!this.closed) {
+            this.sendMessage({
+              id: message.id,
+              error: buildJsonRpcError(error?.rpcCode ?? -32000, error?.message ?? String(error))
+            });
+          }
+        }
+      );
   }
 
   handleExit(error) {

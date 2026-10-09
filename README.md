@@ -161,6 +161,20 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- `--write` selects `workspace-write`, otherwise the run is `read-only`. The plugin never asks for full access.
+- when Codex asks for approval is up to your Codex config (`approval_policy`, default `on-request`); the plugin no longer forces `never`.
+- `--approvals <ask|auto-review|deny>` decides who answers those requests: `ask` (default) lets you decide with `/codex:approve`, `auto-review` hands them to Codex's built-in reviewer, `deny` declines them all. Only `--background` runs can wait for you; foreground runs decline and list the requests in the output.
+
+### `/codex:approve`
+
+Shows approval requests from a running background Codex job one at a time and records your answer. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`).
+
+```bash
+/codex:approve
+/codex:approve task-abc123
+```
+
+`node scripts/codex-companion.mjs protocol-check` compares the installed Codex app-server protocol with the fields and approval methods the plugin relies on. Run it after updating Codex.
 
 ### `/codex:transfer`
 

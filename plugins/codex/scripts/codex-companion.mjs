@@ -21,7 +21,14 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import {
+  createApprovalHandler,
+  listPendingApprovals,
+  normalizeApprovalMode,
+  recordApprovalDecision
+} from "./lib/approvals.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { renderProtocolCheck, runProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -54,6 +61,7 @@ import {
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  renderApprovalList,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -79,11 +87,14 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs approvals [job-id] [--json]",
+      "  node scripts/codex-companion.mjs approve <job-id> <approval-id> --decision <accept|decline> [--json]",
+      "  node scripts/codex-companion.mjs protocol-check [--json]"
     ].join("\n")
   );
 }
@@ -370,7 +381,8 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
-      onProgress: request.onProgress
+      onProgress: request.onProgress,
+      serverRequestHandler: createApprovalHandler({ mode: "ask", interactive: false, onProgress: request.onProgress })
     });
     const payload = {
       review: reviewName,
@@ -413,7 +425,8 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    serverRequestHandler: createApprovalHandler({ mode: "ask", interactive: false, onProgress: request.onProgress })
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -482,6 +495,15 @@ async function executeTaskRun(request) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
+  const approvalMode = normalizeApprovalMode(request.approvalMode);
+  const serverRequestHandler = createApprovalHandler({
+    mode: approvalMode ?? "ask",
+    // Only a detached worker can wait while Claude asks the user.
+    interactive: Boolean(request.interactiveApprovals),
+    workspaceRoot,
+    jobId: request.jobId ?? null,
+    onProgress: request.onProgress
+  });
   const result = await runAppServerTurn(workspaceRoot, {
     resumeThreadId,
     prompt: request.prompt,
@@ -489,6 +511,8 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    approvalMode,
+    serverRequestHandler,
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -505,7 +529,8 @@ async function executeTaskRun(request) {
     {
       title: taskMetadata.title,
       jobId: request.jobId ?? null,
-      write: Boolean(request.write)
+      write: Boolean(request.write),
+      approvals: result.approvals
     }
   );
   const payload = {
@@ -513,7 +538,8 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    approvals: result.approvals
   };
 
   return {
@@ -601,13 +627,14 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, approvalMode, resumeLast, jobId }) {
   return {
     cwd,
     model,
     effort,
     prompt,
     write,
+    approvalMode,
     resumeLast,
     jobId
   };
@@ -761,7 +788,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "approvals"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -780,6 +807,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const approvalMode = normalizeApprovalMode(options.approvals);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -796,6 +824,7 @@ async function handleTask(argv) {
       effort,
       prompt,
       write,
+      approvalMode,
       resumeLast,
       jobId: job.id
     });
@@ -814,6 +843,7 @@ async function handleTask(argv) {
         effort,
         prompt,
         write,
+        approvalMode,
         resumeLast,
         jobId: job.id,
         onProgress: progress
@@ -874,10 +904,67 @@ async function handleTaskWorker(argv) {
     () =>
       executeTaskRun({
         ...request,
+        interactiveApprovals: true,
         onProgress: progress
       }),
     { logFile }
   );
+}
+
+function resolveActiveTaskJob(workspaceRoot, reference) {
+  const job = listJobs(workspaceRoot).find((candidate) => candidate.id === reference);
+  if (!job) {
+    throw new Error(`No Codex job "${reference}".`);
+  }
+  if (job.status !== "running" && job.status !== "queued") {
+    throw new Error(`Codex job ${reference} is ${job.status}; it has no open approvals.`);
+  }
+  return job;
+}
+
+function handleApprovals(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const reference = positionals[0] ?? "";
+  const jobs = reference
+    ? [resolveActiveTaskJob(workspaceRoot, reference)]
+    : filterJobsForCurrentClaudeSession(listJobs(workspaceRoot)).filter((job) => isActiveJobStatus(job.status));
+  const pending = jobs.flatMap((job) => listPendingApprovals(workspaceRoot, job.id));
+  outputCommandResult({ pending }, renderApprovalList(pending), options.json);
+}
+
+function handleApprove(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "decision"],
+    booleanOptions: ["json"]
+  });
+
+  const [jobId, approvalId] = positionals;
+  if (!jobId || !approvalId || !options.decision) {
+    throw new Error("Usage: approve <job-id> <approval-id> --decision <accept|decline>");
+  }
+  const workspaceRoot = resolveCommandWorkspace(options);
+  resolveActiveTaskJob(workspaceRoot, jobId);
+  const record = recordApprovalDecision(workspaceRoot, jobId, approvalId, String(options.decision).trim().toLowerCase());
+  const rendered = `Recorded ${record.decision} for ${approvalId} (job ${jobId}).\n`;
+  outputCommandResult({ jobId, ...record }, rendered, options.json);
+}
+
+function handleProtocolCheck(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const report = runProtocolCheck(resolveCommandCwd(options));
+  outputCommandResult(report, renderProtocolCheck(report), options.json);
+  if (!report.ok) {
+    process.exitCode = 1;
+  }
 }
 
 async function handleStatus(argv) {
@@ -1060,6 +1147,15 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "approvals":
+      handleApprovals(argv);
+      break;
+    case "approve":
+      handleApprove(argv);
+      break;
+    case "protocol-check":
+      handleProtocolCheck(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
