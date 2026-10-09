@@ -74,6 +74,7 @@ test("continue is not exposed as a user-facing command", () => {
   const commandFiles = fs.readdirSync(path.join(PLUGIN_ROOT, "commands")).sort();
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
+    "approve.md",
     "cancel.md",
     "rescue.md",
     "result.md",

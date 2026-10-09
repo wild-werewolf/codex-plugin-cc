@@ -116,6 +116,87 @@ function send(message) {
   process.stdout.write(JSON.stringify(message) + "\\n");
 }
 
+const SANDBOX_TYPES = { "read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess" };
+
+// Thread permissions as the real app-server reports them: the requested
+// sandbox, the config approval policy when none is sent, the "user" reviewer.
+function buildPermissionResult(params) {
+  const type = BEHAVIOR === "sandbox-escalated" ? "dangerFullAccess" : SANDBOX_TYPES[params.sandbox || "read-only"];
+  return {
+    approvalPolicy: params.approvalPolicy || "on-request",
+    approvalsReviewer: params.approvalsReviewer || "user",
+    sandbox: { type, networkAccess: false }
+  };
+}
+
+const pendingServerRequests = new Map();
+let nextServerRequestId = 1;
+
+// Send a server request; \`answered\` resolves with the client's response.
+// \`before\` and \`after\` messages share one stdout write with the request.
+function requestFromClient(method, params, options = {}) {
+  const id = "srv_" + nextServerRequestId++;
+  const answered = new Promise((resolve) => {
+    pendingServerRequests.set(id, resolve);
+  });
+  const lines = [options.before, { id, method, params }, options.after].filter(Boolean);
+  process.stdout.write(lines.map((line) => JSON.stringify(line) + "\\n").join(""));
+  return { id, answered };
+}
+
+function commandApprovalRequest(thread, turnId) {
+  return {
+    method: "item/commandExecution/requestApproval",
+    params: {
+      kind: "command",
+      threadId: thread.id,
+      turnId,
+      itemId: "cmd_" + turnId,
+      startedAtMs: Date.now(),
+      environmentId: null,
+      command: "npm install left-pad",
+      cwd: thread.cwd,
+      reason: "needs network access"
+    }
+  };
+}
+
+const APPROVAL_SCENARIOS = {
+  "approval-command": { order: "after", build: commandApprovalRequest },
+  "approval-before-turn-response": { order: "before", build: commandApprovalRequest },
+  "approval-with-turn-response": { order: "same-chunk", build: commandApprovalRequest },
+  "approval-resolved": { order: "after", resolveAfterMs: 1500, build: commandApprovalRequest },
+  "approval-permissions": {
+    order: "after",
+    build: (thread, turnId) => ({
+      method: "item/permissions/requestApproval",
+      params: {
+        threadId: thread.id,
+        turnId,
+        itemId: "perm_" + turnId,
+        startedAtMs: Date.now(),
+        environmentId: null,
+        cwd: thread.cwd,
+        reason: "fetch a dependency",
+        permissions: { network: { enabled: true }, fileSystem: { write: [thread.cwd + "/vendor"], read: null } }
+      }
+    })
+  }
+};
+
+function approvalDecisionText(response) {
+  if (!response) {
+    return "none";
+  }
+  if (response.error) {
+    return "error:" + response.error.code;
+  }
+  if (response.result && "permissions" in response.result) {
+    return JSON.stringify(response.result);
+  }
+  return JSON.stringify(response.result && response.result.decision);
+}
+
 function nextThread(state, cwd, ephemeral) {
   const thread = {
     id: "thr_" + state.nextThreadId++,
@@ -256,6 +337,10 @@ if (args[0] === "app-server" && args[1] === "--help") {
   console.log("fake app-server help");
   process.exit(0);
 }
+if (args[0] === "app-server" && args[1]) {
+  console.error("fake codex: unsupported app-server subcommand " + args[1]);
+  process.exit(2);
+}
 if (args[0] === "login" && args[1] === "status") {
   if (BEHAVIOR === "logged-out" || BEHAVIOR === "refreshable-auth" || BEHAVIOR === "auth-run-fails" || BEHAVIOR === "provider-no-auth" || BEHAVIOR === "env-key-provider" || BEHAVIOR === "api-key-account-only") {
     console.error("not authenticated");
@@ -281,6 +366,14 @@ rl.on("line", (line) => {
   }
 
   const message = JSON.parse(line);
+  if (message.method === undefined && message.id !== undefined) {
+    const resolveResponse = pendingServerRequests.get(message.id);
+    if (resolveResponse) {
+      pendingServerRequests.delete(message.id);
+      resolveResponse(message);
+    }
+    return;
+  }
   const state = loadState();
 
   try {
@@ -313,7 +406,9 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        state.lastThreadStart = message.params;
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, ...buildPermissionResult(message.params), reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +441,9 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = message.params;
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, ...buildPermissionResult(message.params), reasoningEffort: null } });
         break;
       }
 
@@ -449,9 +545,53 @@ rl.on("line", (line) => {
 	          turnId,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
+	          approvalPolicy: message.params.approvalPolicy ?? null,
+	          approvalsReviewer: message.params.approvalsReviewer ?? null,
+	          sandboxPolicy: message.params.sandboxPolicy ?? null,
 	          prompt
 	        };
 	        saveState(state);
+
+	        const approvalScenario = APPROVAL_SCENARIOS[BEHAVIOR];
+	        if (approvalScenario) {
+	          const turnResponse = { id: message.id, result: { turn: buildTurn(turnId) } };
+	          const request = approvalScenario.build(thread, turnId);
+	          const { id: requestId, answered } = requestFromClient(request.method, request.params, {
+	            // Race the turn/start response: the request goes out first, or in
+	            // the same stdout chunk right after it.
+	            before: approvalScenario.order === "before" ? turnResponse : null,
+	            after: approvalScenario.order === "same-chunk" ? turnResponse : null
+	          });
+	          if (approvalScenario.order === "after") {
+	            send(turnResponse);
+	          }
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          const finishTurn = (response) => {
+	            const latest = loadState();
+	            latest.approvalResponses = [...(latest.approvalResponses || []), response];
+	            saveState(latest);
+	            const text = "Approval decision: " + approvalDecisionText(response);
+	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text, phase: "final_answer" } } });
+	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
+	          };
+	          if (approvalScenario.resolveAfterMs) {
+	            // Codex closes the request itself (e.g. the turn moved on) and
+	            // finishes the turn without waiting for the client.
+	            setTimeout(() => {
+	              send({ method: "serverRequest/resolved", params: { threadId: thread.id, requestId } });
+	              answered.then((response) => {
+	                const latest = loadState();
+	                latest.lateApprovalResponses = [...(latest.lateApprovalResponses || []), response];
+	                saveState(latest);
+	              });
+	              finishTurn(null);
+	            }, approvalScenario.resolveAfterMs);
+	          } else {
+	            answered.then(finishTurn);
+	          }
+	          break;
+	        }
+
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict

@@ -145,6 +145,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.logFile && options.showLog) {
     lines.push(`  Log: ${job.logFile}`);
   }
+  if (job.status === "running" && job.phase === "awaiting-approval") {
+    lines.push(`  Waiting for approval: /codex:approve ${job.id}`);
+  }
   if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
@@ -187,6 +190,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
     ""
   ];
 
@@ -312,14 +316,62 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+const APPROVAL_SOURCE_LABELS = {
+  user: "by the user",
+  timeout: "no answer before the timeout",
+  "resolved-by-server": "closed by Codex",
+  "deny-mode": "approval mode is deny",
+  "non-interactive": "foreground runs cannot ask; rerun with --background",
+  review: "reviews cannot ask the user",
+  closed: "the Codex connection closed before an answer"
+};
+
+export function renderApprovalSection(approvals) {
+  if (!Array.isArray(approvals) || approvals.length === 0) {
+    return "";
+  }
+  const lines = ["", "Approval requests:"];
+  for (const entry of approvals) {
+    const verdict = entry.decision === "accept" ? "accepted" : "declined";
+    const source = APPROVAL_SOURCE_LABELS[entry.source] ?? entry.source ?? "";
+    lines.push(`- ${verdict}: ${entry.summary}${source ? ` (${source})` : ""}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 export function renderTaskResult(parsedResult, meta) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
+  const approvalSection = renderApprovalSection(meta?.approvals);
   if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    return `${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}${approvalSection}`;
   }
 
   const message = String(parsedResult?.failureMessage ?? "").trim() || "Codex did not return a final message.";
-  return `${message}\n`;
+  return `${message}\n${approvalSection}`;
+}
+
+export function renderApprovalList(entries) {
+  if (!entries.length) {
+    return "No Codex approval requests are waiting.\n";
+  }
+  const lines = ["# Pending Codex Approvals", ""];
+  for (const entry of entries) {
+    lines.push(`- ${entry.approvalId} (job ${entry.jobId}, ${entry.kind}): ${entry.summary}`);
+    if (entry.command) {
+      lines.push(`  Command: ${entry.command}`);
+    }
+    if (entry.cwd) {
+      lines.push(`  Directory: ${entry.cwd}`);
+    }
+    if (entry.grantRoot) {
+      lines.push(`  Write root: ${entry.grantRoot}`);
+    }
+    if (entry.reason) {
+      lines.push(`  Reason: ${entry.reason}`);
+    }
+    lines.push(`  Expires: ${entry.expiresAt}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 export function renderStatusReport(report) {
@@ -403,7 +455,7 @@ export function renderStoredJobResult(job, storedJob) {
     (typeof storedJob?.result?.codex?.stdout === "string" && storedJob.result.codex.stdout) ||
     "";
   if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+    const output = `${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}${renderApprovalSection(storedJob?.result?.approvals)}`;
     if (!threadId) {
       return output;
     }

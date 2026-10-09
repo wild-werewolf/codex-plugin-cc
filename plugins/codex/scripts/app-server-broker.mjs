@@ -7,6 +7,7 @@ import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { failClosedServerRequestResult } from "./lib/approvals.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -35,6 +36,14 @@ function send(socket, message) {
 
 function isInterruptRequest(message) {
   return message?.method === "turn/interrupt";
+}
+
+function isResponseMessage(message) {
+  return message?.id !== undefined && message?.method === undefined && ("result" in message || "error" in message);
+}
+
+function serverRequestKey(id) {
+  return JSON.stringify(id);
 }
 
 function writePidFile(pidFile) {
@@ -70,8 +79,22 @@ async function main() {
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
   const sockets = new Set();
+  // Server requests (approvals) forwarded to a client socket, keyed by the
+  // app-server request id. Ids are kept as-is: clients tell them apart from
+  // their own responses because server requests carry a `method`.
+  const forwardedServerRequests = new Map();
+
+  function settleForwardedRequests(socket) {
+    for (const [key, entry] of forwardedServerRequests) {
+      if (entry.socket === socket) {
+        forwardedServerRequests.delete(key);
+        entry.resolve(entry.failClosed());
+      }
+    }
+  }
 
   function clearSocketOwnership(socket) {
+    settleForwardedRequests(socket);
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
@@ -114,6 +137,28 @@ async function main() {
   }
 
   appClient.setNotificationHandler(routeNotification);
+  appClient.setServerRequestHandler((message) => {
+    const target = activeRequestSocket ?? activeStreamSocket;
+    if (!target || target.destroyed) {
+      return failClosedServerRequestResult(message, "No Codex companion client is attached to the shared runtime.");
+    }
+    return new Promise((resolve, reject) => {
+      forwardedServerRequests.set(serverRequestKey(message.id), {
+        socket: target,
+        resolve,
+        reject,
+        failClosed: () => {
+          try {
+            return failClosedServerRequestResult(message, "The Codex companion client disconnected.");
+          } catch (error) {
+            reject(error);
+            return undefined;
+          }
+        }
+      });
+      send(target, message);
+    });
+  });
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
@@ -122,11 +167,13 @@ async function main() {
 
     socket.on("data", async (chunk) => {
       buffer += chunk;
-      let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex !== -1) {
+      // Re-read the buffer on every pass: while this handler awaits a request,
+      // another data event (e.g. the answer to a forwarded approval request)
+      // may already have consumed lines from it.
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newlineIndex);
         buffer = buffer.slice(newlineIndex + 1);
-        newlineIndex = buffer.indexOf("\n");
 
         if (!line.trim()) {
           continue;
@@ -161,6 +208,22 @@ async function main() {
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
           process.exit(0);
+        }
+
+        if (isResponseMessage(message)) {
+          const key = serverRequestKey(message.id);
+          const forwarded = forwardedServerRequests.get(key);
+          if (forwarded && forwarded.socket === socket) {
+            forwardedServerRequests.delete(key);
+            if (message.error) {
+              const error = new Error(message.error.message ?? "Server request failed in the client.");
+              error.rpcCode = message.error.code;
+              forwarded.reject(error);
+            } else {
+              forwarded.resolve(message.result ?? {});
+            }
+          }
+          continue;
         }
 
         if (message.id === undefined) {

@@ -41,6 +41,7 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
+import { buildApprovalRoutingParams } from "./approvals.mjs";
 import { loadBrokerSession } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
@@ -59,13 +60,38 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+const SANDBOX_POLICY_TYPES = new Map([
+  ["read-only", "readOnly"],
+  ["workspace-write", "workspaceWrite"]
+]);
+
+function resolveSandboxMode(sandbox) {
+  const mode = sandbox ?? "read-only";
+  if (!SANDBOX_POLICY_TYPES.has(mode)) {
+    // Full access is never requested by the companion.
+    throw new Error(`Unsupported sandbox mode "${mode}". The companion only uses read-only or workspace-write.`);
+  }
+  return mode;
+}
+
+/**
+ * Permission parameters shared by thread/start and thread/resume.
+ * `approvalPolicy` is deliberately omitted so the user's Codex config decides
+ * when to ask; the sandbox always comes from `--write`.
+ */
+function buildThreadPermissionParams(options = {}) {
+  return {
+    sandbox: resolveSandboxMode(options.sandbox),
+    ...buildApprovalRoutingParams(options.approvalMode)
+  };
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
-    approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only",
+    ...buildThreadPermissionParams(options),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -77,9 +103,49 @@ function buildResumeParams(threadId, cwd, options = {}) {
     threadId,
     cwd,
     model: options.model ?? null,
-    approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    ...buildThreadPermissionParams(options)
   };
+}
+
+/**
+ * turn/start keeps the thread's sandbox (set by start/resume) and repeats the
+ * same model and approval routing, so a turn never widens what the thread got.
+ */
+function buildTurnStartParams(threadId, prompt, options = {}) {
+  return {
+    threadId,
+    input: buildTurnInput(prompt),
+    model: options.model ?? null,
+    effort: options.effort ?? null,
+    outputSchema: options.outputSchema ?? null,
+    ...buildApprovalRoutingParams(options.approvalMode)
+  };
+}
+
+/**
+ * Check what the server actually applied. A thread that came back with a wider
+ * sandbox than requested, or with another reviewer than requested, is refused.
+ */
+function assertThreadPermissions(response, options = {}) {
+  const expectedType = SANDBOX_POLICY_TYPES.get(resolveSandboxMode(options.sandbox));
+  const actualType = response?.sandbox?.type ?? null;
+  if (actualType !== expectedType) {
+    throw new Error(
+      `Codex applied sandbox "${actualType ?? "unknown"}" instead of "${expectedType}". Refusing to run; check the Codex config and permission profile.`
+    );
+  }
+  const expectedReviewer = buildApprovalRoutingParams(options.approvalMode).approvalsReviewer ?? null;
+  if (expectedReviewer && response?.approvalsReviewer && response.approvalsReviewer !== expectedReviewer) {
+    throw new Error(
+      `Codex routed approvals to "${response.approvalsReviewer}" instead of "${expectedReviewer}". Refusing to run.`
+    );
+  }
+}
+
+function describeThreadPermissions(response) {
+  const policy = response?.approvalPolicy;
+  const policyLabel = typeof policy === "string" ? policy : policy ? JSON.stringify(policy) : "unknown";
+  return `sandbox ${response?.sandbox?.type ?? "unknown"}, approvals ${policyLabel}, reviewer ${response?.approvalsReviewer ?? "unknown"}`;
 }
 
 /** @returns {UserInput[]} */
@@ -610,10 +676,11 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
   }
 }
 
-async function withAppServer(cwd, fn) {
+async function withAppServer(cwd, fn, options = {}) {
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd);
+    client.setServerRequestHandler(options.serverRequestHandler ?? null);
     const result = await fn(client);
     await client.close();
     return result;
@@ -633,6 +700,7 @@ async function withAppServer(cwd, fn) {
     }
 
     const directClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
+    directClient.setServerRequestHandler(options.serverRequestHandler ?? null);
     try {
       return await fn(directClient);
     } finally {
@@ -731,6 +799,7 @@ async function requestExternalAgentSessionImport(client, params) {
 
 async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
+  assertThreadPermissions(response, options);
   const threadId = response.thread.id;
   if (options.threadName) {
     try {
@@ -748,7 +817,9 @@ async function startThread(client, cwd, options = {}) {
 }
 
 async function resumeThread(client, threadId, cwd, options = {}) {
-  return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  const response = await client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+  assertThreadPermissions(response, options);
+  return response;
 }
 
 function buildResultStatus(turnState) {
@@ -1010,11 +1081,12 @@ export async function runAppServerReview(cwd, options = {}) {
     const thread = await startThread(client, cwd, {
       model: options.model,
       sandbox: "read-only",
+      approvalMode: options.approvalMode,
       ephemeral: true,
       threadName: options.threadName
     });
     const sourceThreadId = thread.thread.id;
-    emitProgress(options.onProgress, `Thread ready (${sourceThreadId}).`, "starting", {
+    emitProgress(options.onProgress, `Thread ready (${sourceThreadId}; ${describeThreadPermissions(thread)}).`, "starting", {
       threadId: sourceThreadId
     });
     const delivery = options.delivery ?? "inline";
@@ -1050,9 +1122,10 @@ export async function runAppServerReview(cwd, options = {}) {
       reasoningSummary: turnState.reasoningSummary,
       turn: turnState.finalTurn,
       error: turnState.error,
-      stderr: cleanCodexStderr(client.stderr)
+      stderr: cleanCodexStderr(client.stderr),
+      approvals: options.serverRequestHandler?.decisions ?? []
     };
-  });
+  }, { serverRequestHandler: options.serverRequestHandler });
 }
 
 export async function importExternalAgentSession(cwd, options = {}) {
@@ -1100,27 +1173,28 @@ export async function runAppServerTurn(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     let threadId;
+    let threadResponse;
+    const permissionOptions = {
+      model: options.model,
+      sandbox: options.sandbox,
+      approvalMode: options.approvalMode
+    };
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
-        ephemeral: false
-      });
-      threadId = response.thread.id;
+      threadResponse = await resumeThread(client, options.resumeThreadId, cwd, permissionOptions);
+      threadId = threadResponse.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
-      const response = await startThread(client, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
+      threadResponse = await startThread(client, cwd, {
+        ...permissionOptions,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });
-      threadId = response.thread.id;
+      threadId = threadResponse.thread.id;
     }
 
-    emitProgress(options.onProgress, `Thread ready (${threadId}).`, "starting", {
+    emitProgress(options.onProgress, `Thread ready (${threadId}; ${describeThreadPermissions(threadResponse)}).`, "starting", {
       threadId
     });
 
@@ -1132,14 +1206,7 @@ export async function runAppServerTurn(cwd, options = {}) {
     const turnState = await captureTurn(
       client,
       threadId,
-      () =>
-        client.request("turn/start", {
-          threadId,
-          input: buildTurnInput(prompt),
-          model: options.model ?? null,
-          effort: options.effort ?? null,
-          outputSchema: options.outputSchema ?? null
-        }),
+      () => client.request("turn/start", buildTurnStartParams(threadId, prompt, options)),
       { onProgress: options.onProgress }
     );
 
@@ -1154,9 +1221,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       stderr: cleanCodexStderr(client.stderr),
       fileChanges: turnState.fileChanges,
       touchedFiles: collectTouchedFiles(turnState.fileChanges),
-      commandExecutions: turnState.commandExecutions
+      commandExecutions: turnState.commandExecutions,
+      approvals: options.serverRequestHandler?.decisions ?? []
     };
-  });
+  }, { serverRequestHandler: options.serverRequestHandler });
 }
 
 export async function findLatestTaskThread(cwd) {
@@ -1216,4 +1284,11 @@ export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }
 
-export { DEFAULT_CONTINUE_PROMPT, TASK_THREAD_PREFIX };
+export {
+  assertThreadPermissions,
+  buildResumeParams,
+  buildThreadParams,
+  buildTurnStartParams,
+  DEFAULT_CONTINUE_PROMPT,
+  TASK_THREAD_PREFIX
+};

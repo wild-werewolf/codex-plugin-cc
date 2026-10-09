@@ -72,6 +72,33 @@ One simple first run is:
 /codex:result
 ```
 
+### Installing this fork (`wild-codex`)
+
+This fork adds approval handling (`--approvals`, `/codex:approve`) on top of the upstream plugin. Its marketplace is named `wild-codex` so it does not clash with `openai-codex`; the plugin itself is still called `codex`, so only one of the two should be enabled at a time:
+
+```bash
+/plugin marketplace add wild-werewolf/codex-plugin-cc
+/plugin disable codex@openai-codex
+/plugin install codex@wild-codex
+/reload-plugins
+```
+
+Skip the `disable` step if the upstream plugin was never installed. To go back, run `/plugin disable codex@wild-codex` and `/plugin enable codex@openai-codex`.
+
+#### Pulling in upstream changes
+
+```bash
+git remote add upstream https://github.com/openai/codex-plugin-cc.git   # once
+git fetch upstream
+git checkout approvals
+git rebase upstream/main
+npm test
+node plugins/codex/scripts/codex-companion.mjs protocol-check
+git push --force-with-lease origin approvals
+```
+
+Resolve conflicts in favor of the approval handling (no `approvalPolicy: "never"`, no session-wide grants). If upstream bumped its version, set the fork version to match, for example `node scripts/bump-version.mjs 1.0.7-approvals.1`, and check it with `npm run check-version`. `protocol-check` needs the Codex CLI on `PATH` and should report `compatible`; re-run it whenever Codex itself is updated. After the change lands on the fork's `main`, refresh the plugin with `/plugin marketplace update wild-codex`.
+
 ## Usage
 
 ### `/codex:review`
@@ -97,6 +124,8 @@ Examples:
 ```
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
+
+Reviews cannot stop to ask you, so approval requests Codex sends during a review are declined and listed under "Approval requests" in the output. `--approvals auto-review` hands them to Codex's built-in reviewer instead; `--approvals ask` and `deny` keep the default (decline). The same flag works for `/codex:adversarial-review`.
 
 ### `/codex:adversarial-review`
 
@@ -161,6 +190,20 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- `--write` selects `workspace-write`, otherwise the run is `read-only`. The plugin never asks for full access.
+- when Codex asks for approval is up to your Codex config (`approval_policy`, default `on-request`); the plugin no longer forces `never`.
+- `--approvals <ask|auto-review|deny>` decides who answers those requests: `ask` (default) lets you decide with `/codex:approve`, `auto-review` hands them to Codex's built-in reviewer, `deny` declines them all. Only `--background` runs can wait for you; foreground runs decline and list the requests in the output.
+
+### `/codex:approve`
+
+Shows approval requests from a running background Codex job one at a time and records your answer. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`). The first answer is final, and inside a Claude session only jobs started from that session can be answered.
+
+```bash
+/codex:approve
+/codex:approve task-abc123
+```
+
+`node scripts/codex-companion.mjs protocol-check` compares the installed Codex app-server protocol with the fields and approval methods the plugin relies on. Run it after updating Codex.
 
 ### `/codex:transfer`
 
@@ -221,6 +264,8 @@ Examples:
 
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
+
+It also reports whether the installed Codex app-server protocol matches what the plugin expects (`compatible`, `incompatible`, or `unverified` when the schema cannot be generated). This line is informational and does not change whether setup is ready; run `node scripts/codex-companion.mjs protocol-check` for details.
 
 You can also use `/codex:setup` to manage the optional review gate.
 

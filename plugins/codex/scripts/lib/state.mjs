@@ -16,6 +16,33 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Readers (status, approvals, a worker's progress updates) run concurrently
+// with writers, and a half-written state.json reads as an empty state that a
+// later save would persist. Write to a temp file and rename it into place.
+function writeFileAtomic(filePath, contents) {
+  const tempPath = `${filePath}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+  fs.writeFileSync(tempPath, contents, "utf8");
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      fs.renameSync(tempPath, filePath);
+      return;
+    } catch (error) {
+      // Windows refuses to replace a file another process has open; retry
+      // briefly, then fall back to a plain write.
+      if ((error?.code === "EPERM" || error?.code === "EACCES" || error?.code === "EBUSY") && attempt < 10) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+        continue;
+      }
+      fs.rmSync(tempPath, { force: true });
+      if (error?.code === "EPERM" || error?.code === "EACCES" || error?.code === "EBUSY") {
+        fs.writeFileSync(filePath, contents, "utf8");
+        return;
+      }
+      throw error;
+    }
+  }
+}
+
 function defaultState() {
   return {
     version: STATE_VERSION,
@@ -109,9 +136,11 @@ export function saveState(cwd, state) {
     }
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
+    // Approval requests and decisions recorded for the job (see approvals.mjs).
+    fs.rmSync(path.join(resolveJobsDir(cwd), `${job.id}.approvals`), { recursive: true, force: true });
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
@@ -166,7 +195,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 
