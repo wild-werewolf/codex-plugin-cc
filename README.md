@@ -98,6 +98,8 @@ Examples:
 
 This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
 
+Reviews cannot stop to ask you, so approval requests Codex sends during a review are declined and listed under "Approval requests" in the output. `--approvals auto-review` hands them to Codex's built-in reviewer instead; `--approvals ask` and `deny` keep the default (decline). The same flag works for `/codex:adversarial-review`.
+
 ### `/codex:adversarial-review`
 
 Runs a **steerable** review that questions the chosen implementation and design.
@@ -167,7 +169,7 @@ Ask Codex to redesign the database connection to be more resilient.
 
 ### `/codex:approve`
 
-Shows approval requests from a running background Codex job one at a time and records your answer. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`).
+Shows approval requests from a running background Codex job one at a time and records your answer. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`). The first answer is final, and inside a Claude session only jobs started from that session can be answered.
 
 ```bash
 /codex:approve
@@ -235,6 +237,8 @@ Examples:
 
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
+
+It also reports whether the installed Codex app-server protocol matches what the plugin expects (`compatible`, `incompatible`, or `unverified` when the schema cannot be generated). This line is informational and does not change whether setup is ready; run `node scripts/codex-companion.mjs protocol-check` for details.
 
 You can also use `/codex:setup` to manage the optional review gate.
 

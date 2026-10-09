@@ -52,6 +52,7 @@ export function normalizeApprovalMode(value) {
 /**
  * Thread/turn parameters that route approval requests. Without an explicit
  * mode nothing is sent, so the reviewer from the user's Codex config applies.
+ * @returns {{ approvalsReviewer?: "user" | "auto_review" }}
  */
 export function buildApprovalRoutingParams(mode) {
   if (mode === "auto-review") {
@@ -64,7 +65,7 @@ export function buildApprovalRoutingParams(mode) {
 }
 
 function unsupportedServerRequest(message) {
-  const error = new Error(`Unsupported server request: ${message.method}`);
+  const error = /** @type {Error & { rpcCode?: number }} */ (new Error(`Unsupported server request: ${message.method}`));
   error.rpcCode = -32601;
   return error;
 }
@@ -190,6 +191,51 @@ function writeJsonAtomic(filePath, payload) {
   fs.renameSync(tempPath, filePath);
 }
 
+/**
+ * Create `filePath` with `payload` only if it does not exist yet, atomically:
+ * the file appears complete or not at all. Returns true when this call created
+ * it. Used for decisions, so the first decision wins and no later writer
+ * (another `approve`, the timeout, a server-side resolve) can replace it.
+ */
+function createJsonExclusive(filePath, payload) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  try {
+    fs.linkSync(tempPath, filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      return false;
+    }
+    // File systems without hard links: fall back to an exclusive create.
+    try {
+      fs.writeFileSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+      return true;
+    } catch (fallbackError) {
+      if (fallbackError?.code === "EEXIST") {
+        return false;
+      }
+      throw fallbackError;
+    }
+  } finally {
+    fs.rmSync(tempPath, { force: true });
+  }
+}
+
+// A decision file that exists but is still being written by the fallback path
+// reads as null for a moment; retry briefly before giving up.
+function readExistingJson(filePath) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const value = readJson(filePath);
+    if (value) {
+      return value;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+  }
+  return null;
+}
+
 function readJson(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -224,8 +270,10 @@ export function listPendingApprovals(workspaceRoot, jobId) {
 }
 
 /**
- * Record a user decision. Only a still-pending request can be decided, and a
- * decision is final: a second, different decision is rejected.
+ * Record a user decision. Only a still-pending request of this job can be
+ * decided, and a decision is final: the first one wins (it may also be the
+ * timeout or Codex closing the request), a repeated identical decision is a
+ * no-op, and a second, different decision is rejected.
  */
 export function recordApprovalDecision(workspaceRoot, jobId, approvalId, decision, options = {}) {
   if (!APPROVAL_DECISIONS.includes(decision)) {
@@ -233,7 +281,7 @@ export function recordApprovalDecision(workspaceRoot, jobId, approvalId, decisio
   }
   const requestPath = approvalFile(workspaceRoot, jobId, approvalId, "request");
   const request = readJson(requestPath);
-  if (!request) {
+  if (!request || request.jobId !== jobId || request.approvalId !== approvalId) {
     throw new Error(`No approval request ${approvalId} for job ${jobId}.`);
   }
   const outcome = readJson(approvalFile(workspaceRoot, jobId, approvalId, "outcome"));
@@ -241,21 +289,23 @@ export function recordApprovalDecision(workspaceRoot, jobId, approvalId, decisio
     throw new Error(`Approval ${approvalId} is already closed (${outcome.decision}, ${outcome.source}).`);
   }
   const decisionPath = approvalFile(workspaceRoot, jobId, approvalId, "decision");
-  const existing = readJson(decisionPath);
-  if (existing) {
-    if (existing.decision === decision) {
-      return existing;
-    }
-    throw new Error(`Approval ${approvalId} was already decided: ${existing.decision}.`);
-  }
   const record = {
     approvalId,
     decision,
     decidedAt: new Date().toISOString(),
     decidedBy: options.decidedBy ?? "user"
   };
-  writeJsonAtomic(decisionPath, record);
-  return record;
+  if (createJsonExclusive(decisionPath, record)) {
+    return record;
+  }
+  const existing = readExistingJson(decisionPath);
+  if (existing?.decision === decision && (existing.decidedBy ?? "user") === record.decidedBy) {
+    return existing;
+  }
+  if (existing && existing.decidedBy && existing.decidedBy !== "user") {
+    throw new Error(`Approval ${approvalId} is already closed (${existing.decision}, ${existing.decidedBy}).`);
+  }
+  throw new Error(`Approval ${approvalId} was already decided: ${existing?.decision ?? "unknown"}.`);
 }
 
 function resolveTimeoutMs(explicit) {
@@ -278,11 +328,14 @@ function requestKey(id) {
  * - without an interactive channel (foreground runs, reviews) or in `deny`
  *   mode they are declined immediately;
  * - `auto-review` normally keeps requests on the Codex side; any request that
- *   still reaches the client is treated like `ask`.
+ *   still reaches the client is treated like `ask`;
+ * - when the connection closes, every request still waiting is declined.
  */
 export function createApprovalHandler(options = {}) {
   const mode = options.mode ?? "ask";
   const interactive = Boolean(options.interactive && options.workspaceRoot && options.jobId);
+  const nonInteractiveReason = options.nonInteractiveReason ?? "this run cannot ask the user (rerun with --background)";
+  const nonInteractiveSource = options.nonInteractiveSource ?? "non-interactive";
   const timeoutMs = resolveTimeoutMs(options.timeoutMs);
   const onProgress = options.onProgress ?? null;
   const decisions = [];
@@ -295,9 +348,6 @@ export function createApprovalHandler(options = {}) {
   }
 
   function closeApproval(approvalId, decision, source) {
-    if (!interactive) {
-      return;
-    }
     writeJsonAtomic(approvalFile(options.workspaceRoot, options.jobId, approvalId, "outcome"), {
       approvalId,
       decision,
@@ -306,7 +356,23 @@ export function createApprovalHandler(options = {}) {
     });
   }
 
-  async function waitForDecision(approvalId, key) {
+  // The decision file is the single source of truth: whoever creates it first
+  // (the user via `approve`, or this worker on timeout/close) decides.
+  function settle(decisionPath, approvalId, fallback) {
+    createJsonExclusive(decisionPath, {
+      approvalId,
+      decision: fallback.decision,
+      decidedAt: new Date().toISOString(),
+      decidedBy: fallback.source
+    });
+    const recorded = readExistingJson(decisionPath);
+    if (recorded && APPROVAL_DECISIONS.includes(recorded.decision)) {
+      return { decision: recorded.decision, source: recorded.decidedBy ?? "user" };
+    }
+    return fallback;
+  }
+
+  function waitForDecision(approvalId, key) {
     const decisionPath = approvalFile(options.workspaceRoot, options.jobId, approvalId, "decision");
     const deadline = Date.now() + timeoutMs;
     return new Promise((resolve) => {
@@ -315,7 +381,7 @@ export function createApprovalHandler(options = {}) {
         if (recorded && APPROVAL_DECISIONS.includes(recorded.decision)) {
           finish({ decision: recorded.decision, source: recorded.decidedBy ?? "user" });
         } else if (Date.now() >= deadline) {
-          finish({ decision: "decline", source: "timeout" });
+          finish(settle(decisionPath, approvalId, { decision: "decline", source: "timeout" }));
         }
       }, DECISION_POLL_INTERVAL_MS);
       function finish(result) {
@@ -323,7 +389,13 @@ export function createApprovalHandler(options = {}) {
         waiting.delete(key);
         resolve(result);
       }
-      waiting.set(key, () => finish({ decision: "decline", source: "resolved-by-server" }));
+      // Codex closed the request, or the connection is gone: no answer can
+      // reach Codex any more. Claim the decision so a late `approve` is
+      // rejected, and record the request as declined.
+      waiting.set(key, (source) => {
+        settle(decisionPath, approvalId, { decision: "decline", source });
+        finish({ decision: "decline", source });
+      });
     });
   }
 
@@ -333,10 +405,11 @@ export function createApprovalHandler(options = {}) {
     }
 
     const description = describeApprovalRequest(message.method, message.params);
-    if (mode === "deny" || !interactive) {
-      const why = mode === "deny" ? "approval mode is deny" : "this run cannot ask the user (rerun with --background)";
+    if (mode === "deny" || !interactive || handle.closed) {
+      const why = mode === "deny" ? "approval mode is deny" : handle.closed ? "the run is finishing" : nonInteractiveReason;
+      const source = mode === "deny" ? "deny-mode" : handle.closed ? "closed" : nonInteractiveSource;
       report(`Declined approval request: ${description.summary} (${why}).`);
-      decisions.push({ method: message.method, ...description, decision: "decline", source: mode === "deny" ? "deny-mode" : "non-interactive" });
+      decisions.push({ method: message.method, ...description, decision: "decline", source });
       return buildApprovalResponse(message.method, message.params, "decline", `Declined: ${why}.`);
     }
 
@@ -354,20 +427,47 @@ export function createApprovalHandler(options = {}) {
       expiresAt: new Date(Date.now() + timeoutMs).toISOString(),
       ...description
     });
+    const pending = waitForDecision(approvalId, key);
     report(`Waiting for approval ${approvalId}: ${description.summary}. Run /codex:approve ${options.jobId}.`, AWAITING_APPROVAL_PHASE);
 
-    const { decision, source } = await waitForDecision(approvalId, key);
+    const { decision, source } = await pending;
     closeApproval(approvalId, decision, source);
     decisions.push({ method: message.method, approvalId, ...description, decision, source });
-    report(`Approval ${approvalId} ${decision === "accept" ? "accepted" : "declined"} (${source}).`, "running");
+    // Stay in awaiting-approval while other requests of this run still wait.
+    report(`Approval ${approvalId} ${decision === "accept" ? "accepted" : "declined"} (${source}).`, waiting.size === 0 ? "running" : null);
     return buildApprovalResponse(message.method, message.params, decision, `Declined (${source}).`);
   }
 
   handle.onResolved = (params) => {
-    const resolve = waiting.get(requestKey(params?.requestId));
-    resolve?.();
+    waiting.get(requestKey(params?.requestId))?.("resolved-by-server");
   };
+  // Called when the app-server connection ends: nobody can answer any more.
+  handle.onClosed = () => {
+    handle.closed = true;
+    for (const cancel of [...waiting.values()]) {
+      cancel("closed");
+    }
+  };
+  handle.closed = false;
+  handle.pendingCount = () => waiting.size;
   handle.decisions = decisions;
   handle.mode = mode;
   return handle;
+}
+
+/**
+ * Wrap a progress reporter so turn events cannot move the job out of
+ * `awaiting-approval` while a request of `handler` is still waiting.
+ */
+export function holdAwaitingApprovalPhase(onProgress, handler) {
+  if (!onProgress) {
+    return onProgress;
+  }
+  return (event) => {
+    if (handler.pendingCount?.() > 0 && event && typeof event === "object" && event.phase && event.phase !== AWAITING_APPROVAL_PHASE) {
+      onProgress({ ...event, phase: AWAITING_APPROVAL_PHASE });
+      return;
+    }
+    onProgress(event);
+  };
 }

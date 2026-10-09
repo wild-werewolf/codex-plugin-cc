@@ -82,7 +82,8 @@ class AppServerClientBase {
   /**
    * Install the handler for server-initiated requests (approvals, elicitation).
    * It may be async; an optional `handler.onResolved(params)` hears
-   * `serverRequest/resolved` for requests the server closed on its own.
+   * `serverRequest/resolved` for requests the server closed on its own, and
+   * an optional `handler.onClosed()` runs when the connection ends.
    */
   setServerRequestHandler(handler) {
     this.serverRequestHandler = handler ?? null;
@@ -198,6 +199,8 @@ class AppServerClientBase {
 
     this.exitResolved = true;
     this.exitError = error ?? null;
+    // Server requests still waiting for an answer can no longer be answered.
+    this.serverRequestHandler?.onClosed?.();
 
     for (const pending of this.pending.values()) {
       pending.reject(this.exitError ?? new Error("codex app-server connection closed."));

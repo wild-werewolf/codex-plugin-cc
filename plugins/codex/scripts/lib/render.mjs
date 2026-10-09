@@ -190,6 +190,7 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
     ""
   ];
 
@@ -320,10 +321,12 @@ const APPROVAL_SOURCE_LABELS = {
   timeout: "no answer before the timeout",
   "resolved-by-server": "closed by Codex",
   "deny-mode": "approval mode is deny",
-  "non-interactive": "foreground runs cannot ask; rerun with --background"
+  "non-interactive": "foreground runs cannot ask; rerun with --background",
+  review: "reviews cannot ask the user",
+  closed: "the Codex connection closed before an answer"
 };
 
-function renderApprovalSection(approvals) {
+export function renderApprovalSection(approvals) {
   if (!Array.isArray(approvals) || approvals.length === 0) {
     return "";
   }

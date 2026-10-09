@@ -132,14 +132,57 @@ function buildPermissionResult(params) {
 const pendingServerRequests = new Map();
 let nextServerRequestId = 1;
 
-// Send a server request and resolve with the client's response.
-function requestFromClient(method, params) {
+// Send a server request; \`answered\` resolves with the client's response.
+// \`before\` and \`after\` messages share one stdout write with the request.
+function requestFromClient(method, params, options = {}) {
   const id = "srv_" + nextServerRequestId++;
-  return new Promise((resolve) => {
+  const answered = new Promise((resolve) => {
     pendingServerRequests.set(id, resolve);
-    send({ id, method, params });
   });
+  const lines = [options.before, { id, method, params }, options.after].filter(Boolean);
+  process.stdout.write(lines.map((line) => JSON.stringify(line) + "\\n").join(""));
+  return { id, answered };
 }
+
+function commandApprovalRequest(thread, turnId) {
+  return {
+    method: "item/commandExecution/requestApproval",
+    params: {
+      kind: "command",
+      threadId: thread.id,
+      turnId,
+      itemId: "cmd_" + turnId,
+      startedAtMs: Date.now(),
+      environmentId: null,
+      command: "npm install left-pad",
+      cwd: thread.cwd,
+      reason: "needs network access"
+    }
+  };
+}
+
+const APPROVAL_SCENARIOS = {
+  "approval-command": { order: "after", build: commandApprovalRequest },
+  "approval-before-turn-response": { order: "before", build: commandApprovalRequest },
+  "approval-with-turn-response": { order: "same-chunk", build: commandApprovalRequest },
+  "approval-resolved": { order: "after", resolveAfterMs: 1500, build: commandApprovalRequest },
+  "approval-permissions": {
+    order: "after",
+    build: (thread, turnId) => ({
+      method: "item/permissions/requestApproval",
+      params: {
+        threadId: thread.id,
+        turnId,
+        itemId: "perm_" + turnId,
+        startedAtMs: Date.now(),
+        environmentId: null,
+        cwd: thread.cwd,
+        reason: "fetch a dependency",
+        permissions: { network: { enabled: true }, fileSystem: { write: [thread.cwd + "/vendor"], read: null } }
+      }
+    })
+  }
+};
 
 function approvalDecisionText(response) {
   if (!response) {
@@ -147,6 +190,9 @@ function approvalDecisionText(response) {
   }
   if (response.error) {
     return "error:" + response.error.code;
+  }
+  if (response.result && "permissions" in response.result) {
+    return JSON.stringify(response.result);
   }
   return JSON.stringify(response.result && response.result.decision);
 }
@@ -290,6 +336,10 @@ if (args[0] === "--version") {
 if (args[0] === "app-server" && args[1] === "--help") {
   console.log("fake app-server help");
   process.exit(0);
+}
+if (args[0] === "app-server" && args[1]) {
+  console.error("fake codex: unsupported app-server subcommand " + args[1]);
+  process.exit(2);
 }
 if (args[0] === "login" && args[1] === "status") {
   if (BEHAVIOR === "logged-out" || BEHAVIOR === "refreshable-auth" || BEHAVIOR === "auth-run-fails" || BEHAVIOR === "provider-no-auth" || BEHAVIOR === "env-key-provider" || BEHAVIOR === "api-key-account-only") {
@@ -501,30 +551,48 @@ rl.on("line", (line) => {
 	          prompt
 	        };
 	        saveState(state);
-	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
-	        if (BEHAVIOR === "approval-command") {
+	        const approvalScenario = APPROVAL_SCENARIOS[BEHAVIOR];
+	        if (approvalScenario) {
+	          const turnResponse = { id: message.id, result: { turn: buildTurn(turnId) } };
+	          const request = approvalScenario.build(thread, turnId);
+	          const { id: requestId, answered } = requestFromClient(request.method, request.params, {
+	            // Race the turn/start response: the request goes out first, or in
+	            // the same stdout chunk right after it.
+	            before: approvalScenario.order === "before" ? turnResponse : null,
+	            after: approvalScenario.order === "same-chunk" ? turnResponse : null
+	          });
+	          if (approvalScenario.order === "after") {
+	            send(turnResponse);
+	          }
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
-	          requestFromClient("item/commandExecution/requestApproval", {
-	            kind: "command",
-	            threadId: thread.id,
-	            turnId,
-	            itemId: "cmd_" + turnId,
-	            startedAtMs: Date.now(),
-	            environmentId: null,
-	            command: "npm install left-pad",
-	            cwd: thread.cwd,
-	            reason: "needs network access"
-	          }).then((response) => {
+	          const finishTurn = (response) => {
 	            const latest = loadState();
 	            latest.approvalResponses = [...(latest.approvalResponses || []), response];
 	            saveState(latest);
 	            const text = "Approval decision: " + approvalDecisionText(response);
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text, phase: "final_answer" } } });
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          });
+	          };
+	          if (approvalScenario.resolveAfterMs) {
+	            // Codex closes the request itself (e.g. the turn moved on) and
+	            // finishes the turn without waiting for the client.
+	            setTimeout(() => {
+	              send({ method: "serverRequest/resolved", params: { threadId: thread.id, requestId } });
+	              answered.then((response) => {
+	                const latest = loadState();
+	                latest.lateApprovalResponses = [...(latest.lateApprovalResponses || []), response];
+	                saveState(latest);
+	              });
+	              finishTurn(null);
+	            }, approvalScenario.resolveAfterMs);
+	          } else {
+	            answered.then(finishTurn);
+	          }
 	          break;
 	        }
+
+	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

@@ -17,13 +17,28 @@ const REQUIRED_PARAMS = [
   { file: "v2/TurnStartParams.json", method: "turn/start", fields: ["threadId", "input", "model", "effort", "outputSchema", "approvalsReviewer"] }
 ];
 
+// Response fields used to verify what the server applied to a thread.
+const REQUIRED_RESPONSE_FIELDS = [
+  { file: "v2/ThreadStartResponse.json", method: "thread/start", fields: ["approvalPolicy", "approvalsReviewer", "sandbox"] },
+  { file: "v2/ThreadResumeResponse.json", method: "thread/resume", fields: ["approvalPolicy", "approvalsReviewer", "sandbox"] }
+];
+
+// `values` are string literals or the single key of an object variant
+// (e.g. the legacy `{ denied: { rejection } }`).
 const REQUIRED_ENUMS = [
   { file: "v2/ThreadStartParams.json", definition: "ApprovalsReviewer", values: ["user", "auto_review"] },
   { file: "v2/ThreadStartParams.json", definition: "SandboxMode", values: ["read-only", "workspace-write"] },
   { file: "CommandExecutionRequestApprovalResponse.json", definition: "CommandExecutionApprovalDecision", values: ["accept", "decline"] },
   { file: "FileChangeRequestApprovalResponse.json", definition: "FileChangeApprovalDecision", values: ["accept", "decline"] },
-  { file: "PermissionsRequestApprovalResponse.json", definition: "PermissionGrantScope", values: ["turn"] }
+  { file: "PermissionsRequestApprovalResponse.json", definition: "PermissionGrantScope", values: ["turn"] },
+  { file: "ExecCommandApprovalResponse.json", definition: "ReviewDecision", name: "ReviewDecision (execCommandApproval)", values: ["approved", "denied"] },
+  { file: "ApplyPatchApprovalResponse.json", definition: "ReviewDecision", name: "ReviewDecision (applyPatchApproval)", values: ["approved", "denied"] },
+  { file: "McpServerElicitationRequestResponse.json", definition: "McpServerElicitationAction", values: ["decline"] }
 ];
+
+// An accepted item/permissions/requestApproval grants exactly these requested
+// fields back; anything else the server may ask for would be dropped.
+const GRANTED_PERMISSION_FIELDS = ["network", "fileSystem"];
 
 const APPROVAL_METHODS_REQUIRED = [
   "item/commandExecution/requestApproval",
@@ -47,6 +62,9 @@ function collectEnumValues(node) {
   const values = [];
   if (Array.isArray(node.enum)) {
     values.push(...node.enum.filter((value) => typeof value === "string"));
+  }
+  if (node.type === "object" && Array.isArray(node.required) && node.required.length === 1) {
+    values.push(node.required[0]);
   }
   for (const key of ["oneOf", "anyOf"]) {
     if (Array.isArray(node[key])) {
@@ -78,16 +96,63 @@ export function checkProtocolSchema(schemaDir) {
     );
   }
 
+  for (const spec of REQUIRED_RESPONSE_FIELDS) {
+    const schema = readSchema(schemaDir, spec.file);
+    const properties = Object.keys(schema?.properties ?? {});
+    const missing = spec.fields.filter((field) => !properties.includes(field));
+    add(
+      `${spec.method} response`,
+      Boolean(schema) && missing.length === 0,
+      !schema ? `${spec.file} not found` : missing.length ? `missing: ${missing.join(", ")}` : "all fields present"
+    );
+  }
+
   for (const spec of REQUIRED_ENUMS) {
     const schema = readSchema(schemaDir, spec.file);
     const values = collectEnumValues(schema?.definitions?.[spec.definition]);
     const missing = spec.values.filter((value) => !values.includes(value));
     add(
-      spec.definition,
+      spec.name ?? spec.definition,
       values.length > 0 && missing.length === 0,
       values.length === 0 ? `${spec.definition} not found in ${spec.file}` : missing.length ? `missing: ${missing.join(", ")}` : values.join(", ")
     );
   }
+
+  const granted = Object.keys(
+    readSchema(schemaDir, "PermissionsRequestApprovalResponse.json")?.definitions?.GrantedPermissionProfile?.properties ?? {}
+  );
+  const missingGrants = GRANTED_PERMISSION_FIELDS.filter((field) => !granted.includes(field));
+  add(
+    "GrantedPermissionProfile",
+    granted.length > 0 && missingGrants.length === 0,
+    granted.length === 0 ? "GrantedPermissionProfile not found" : missingGrants.length ? `missing: ${missingGrants.join(", ")}` : granted.join(", ")
+  );
+
+  const requestable = Object.keys(
+    readSchema(schemaDir, "PermissionsRequestApprovalParams.json")?.definitions?.RequestPermissionProfile?.properties ?? {}
+  );
+  const ungrantable = requestable.filter((field) => !GRANTED_PERMISSION_FIELDS.includes(field));
+  checks.push({
+    name: "RequestPermissionProfile",
+    ok: true,
+    level: requestable.length === 0 || ungrantable.length ? "warning" : "ok",
+    detail:
+      requestable.length === 0
+        ? "RequestPermissionProfile not found"
+        : ungrantable.length
+          ? `${ungrantable.join(", ")} would never be granted on approval`
+          : requestable.join(", ")
+  });
+
+  const notifications = collectServerRequestMethods(readSchema(schemaDir, "ServerNotification.json"));
+  checks.push({
+    name: "serverRequest/resolved",
+    ok: true,
+    level: notifications.includes("serverRequest/resolved") ? "ok" : "warning",
+    detail: notifications.includes("serverRequest/resolved")
+      ? "present"
+      : "missing; waiting approvals end only on decision, timeout, or disconnect"
+  });
 
   const serverRequests = collectServerRequestMethods(readSchema(schemaDir, "ServerRequest.json"));
   const missingApprovals = APPROVAL_METHODS_REQUIRED.filter((method) => !serverRequests.includes(method));
@@ -105,7 +170,7 @@ export function checkProtocolSchema(schemaDir) {
     detail: unknown.length ? `${unknown.join(", ")} (answered as unsupported)` : "none"
   });
 
-  return { ok: checks.every((check) => check.ok), checks };
+  return { ok: checks.every((check) => check.ok), verified: serverRequests.length > 0, checks };
 }
 
 // On Windows runCommand goes through a shell (cmd or $SHELL, often bash), which
@@ -127,6 +192,7 @@ export function runProtocolCheck(cwd, options = {}) {
     if (generated.error || generated.status !== 0) {
       return {
         ok: false,
+        verified: false,
         codexVersion: version.stdout.trim() || null,
         checks: [
           {
@@ -144,8 +210,23 @@ export function runProtocolCheck(cwd, options = {}) {
   }
 }
 
+/** One-line verdict for `setup`: compatible, incompatible, or unverified. */
+export function summarizeProtocolCheck(report) {
+  if (!report.verified) {
+    const failure = report.checks.find((check) => !check.ok);
+    return { status: "unverified", detail: failure?.detail?.split(/\r?\n/)[0] || "schema could not be generated" };
+  }
+  if (!report.ok) {
+    const failures = report.checks.filter((check) => !check.ok).map((check) => check.name);
+    return { status: "incompatible", detail: `${failures.join(", ")}; run protocol-check for details` };
+  }
+  const warnings = report.checks.filter((check) => check.level === "warning").map((check) => check.name);
+  const version = report.codexVersion ?? "unknown Codex";
+  return { status: "compatible", detail: warnings.length ? `${version}; warnings: ${warnings.join(", ")}` : version };
+}
+
 export function renderProtocolCheck(report) {
-  const lines = [`# Codex Protocol Check`, "", `Codex: ${report.codexVersion ?? "unknown"}`, `Result: ${report.ok ? "compatible" : "INCOMPATIBLE"}`, ""];
+  const lines = [`# Codex Protocol Check`, "", `Codex: ${report.codexVersion ?? "unknown"}`, `Result: ${report.ok ? "compatible" : report.verified === false ? "UNVERIFIED" : "INCOMPATIBLE"}`, ""];
   for (const check of report.checks) {
     lines.push(`- [${check.level}] ${check.name}: ${check.detail}`);
   }

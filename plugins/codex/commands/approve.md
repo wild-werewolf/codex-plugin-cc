@@ -24,5 +24,5 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" approve <jobId> <approv
 
 - `Approve once` maps to `accept`; `Decline` and any other or missing answer map to `decline`.
 - Do not approve on the user's behalf, do not approve several requests with one answer, and do not use any other decision value.
-- If `approve` reports that the request is already closed or expired, tell the user. Do not retry it.
+- If `approve` reports that the request is already closed or expired, or that the job was not started from this Claude session, tell the user. Do not retry it.
 - Afterwards, suggest `/codex:status <job-id>` to follow the job.

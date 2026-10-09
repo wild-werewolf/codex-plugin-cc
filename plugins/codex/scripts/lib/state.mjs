@@ -109,6 +109,8 @@ export function saveState(cwd, state) {
     }
     removeJobFile(resolveJobFile(cwd, job.id));
     removeFileIfExists(job.logFile);
+    // Approval requests and decisions recorded for the job (see approvals.mjs).
+    fs.rmSync(path.join(resolveJobsDir(cwd), `${job.id}.approvals`), { recursive: true, force: true });
   }
 
   fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");

@@ -23,12 +23,13 @@ import {
   } from "./lib/codex.mjs";
 import {
   createApprovalHandler,
+  holdAwaitingApprovalPhase,
   listPendingApprovals,
   normalizeApprovalMode,
   recordApprovalDecision
 } from "./lib/approvals.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
-import { renderProtocolCheck, runProtocolCheck } from "./lib/protocol-check.mjs";
+import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
@@ -62,6 +63,7 @@ import {
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderApprovalList,
+  renderApprovalSection,
   renderNativeReviewResult,
   renderReviewResult,
   renderStoredJobResult,
@@ -85,8 +87,8 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
@@ -197,6 +199,10 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
+  // Informational only: protocol drift is reported but does not change `ready`.
+  const protocol = codexStatus.available
+    ? summarizeProtocolCheck(runProtocolCheck(cwd))
+    : { status: "unverified", detail: "Codex CLI is not available" };
 
   const nextSteps = [];
   if (!codexStatus.available) {
@@ -218,6 +224,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    protocol,
     actionsTaken,
     nextSteps
   };
@@ -366,6 +373,19 @@ async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   return findLatestTaskThread(workspaceRoot);
 }
 
+// Reviews run in the foreground and cannot wait for the user: requests that
+// reach the plugin are declined (unless --approvals auto-review keeps them on
+// the Codex side) and listed under "Approval requests".
+function createReviewApprovalHandler(request) {
+  return createApprovalHandler({
+    mode: request.approvalMode ?? "ask",
+    interactive: false,
+    nonInteractiveSource: "review",
+    nonInteractiveReason: "reviews cannot ask the user",
+    onProgress: request.onProgress
+  });
+}
+
 async function executeReviewRun(request) {
   ensureCodexAvailable(request.cwd);
   ensureGitRepository(request.cwd);
@@ -381,8 +401,9 @@ async function executeReviewRun(request) {
     const result = await runAppServerReview(request.cwd, {
       target: reviewTarget,
       model: request.model,
+      approvalMode: request.approvalMode,
       onProgress: request.onProgress,
-      serverRequestHandler: createApprovalHandler({ mode: "ask", interactive: false, onProgress: request.onProgress })
+      serverRequestHandler: createReviewApprovalHandler(request)
     });
     const payload = {
       review: reviewName,
@@ -394,16 +415,17 @@ async function executeReviewRun(request) {
         stderr: result.stderr,
         stdout: result.reviewText,
         reasoning: result.reasoningSummary
-      }
+      },
+      approvals: result.approvals
     };
-    const rendered = renderNativeReviewResult(
+    const rendered = `${renderNativeReviewResult(
       {
         status: result.status,
         stdout: result.reviewText,
         stderr: result.stderr
       },
       { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
-    );
+    )}${renderApprovalSection(result.approvals)}`;
 
     return {
       exitStatus: result.status,
@@ -425,8 +447,9 @@ async function executeReviewRun(request) {
     model: request.model,
     sandbox: "read-only",
     outputSchema: readOutputSchema(REVIEW_SCHEMA),
+    approvalMode: request.approvalMode,
     onProgress: request.onProgress,
-    serverRequestHandler: createApprovalHandler({ mode: "ask", interactive: false, onProgress: request.onProgress })
+    serverRequestHandler: createReviewApprovalHandler(request)
   });
   const parsed = parseStructuredOutput(result.finalMessage, {
     status: result.status,
@@ -450,7 +473,8 @@ async function executeReviewRun(request) {
     result: parsed.parsed,
     rawOutput: parsed.rawOutput,
     parseError: parsed.parseError,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    approvals: result.approvals
   };
 
   return {
@@ -458,11 +482,11 @@ async function executeReviewRun(request) {
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
-    rendered: renderReviewResult(parsed, {
+    rendered: `${renderReviewResult(parsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
-    }),
+    })}${renderApprovalSection(result.approvals)}`,
     summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Codex ${reviewName}`,
     jobClass: "review",
@@ -513,7 +537,7 @@ async function executeTaskRun(request) {
     sandbox: request.write ? "workspace-write" : "read-only",
     approvalMode,
     serverRequestHandler,
-    onProgress: request.onProgress,
+    onProgress: holdAwaitingApprovalPhase(request.onProgress, serverRequestHandler),
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
@@ -738,7 +762,7 @@ function enqueueBackgroundTask(cwd, job, request) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "approvals"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -748,6 +772,7 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
+  const approvalMode = normalizeApprovalMode(options.approvals);
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -773,6 +798,7 @@ async function handleReviewCommand(argv, config) {
         model: options.model,
         focusText,
         reviewName: config.reviewName,
+        approvalMode,
         onProgress: progress
       }),
     { json: options.json }
@@ -948,7 +974,12 @@ function handleApprove(argv) {
     throw new Error("Usage: approve <job-id> <approval-id> --decision <accept|decline>");
   }
   const workspaceRoot = resolveCommandWorkspace(options);
-  resolveActiveTaskJob(workspaceRoot, jobId);
+  const job = resolveActiveTaskJob(workspaceRoot, jobId);
+  // Inside a known Claude session, only that session's own jobs can be decided.
+  const sessionId = getCurrentClaudeSessionId();
+  if (sessionId && job.sessionId !== sessionId) {
+    throw new Error(`Codex job ${jobId} was not started from this Claude session; its approvals cannot be decided here.`);
+  }
   const record = recordApprovalDecision(workspaceRoot, jobId, approvalId, String(options.decision).trim().toLowerCase());
   const rendered = `Recorded ${record.decision} for ${approvalId} (job ${jobId}).\n`;
   outputCommandResult({ jobId, ...record }, rendered, options.json);

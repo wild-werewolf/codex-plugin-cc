@@ -167,11 +167,13 @@ async function main() {
 
     socket.on("data", async (chunk) => {
       buffer += chunk;
-      let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex !== -1) {
+      // Re-read the buffer on every pass: while this handler awaits a request,
+      // another data event (e.g. the answer to a forwarded approval request)
+      // may already have consumed lines from it.
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
         const line = buffer.slice(0, newlineIndex);
         buffer = buffer.slice(newlineIndex + 1);
-        newlineIndex = buffer.indexOf("\n");
 
         if (!line.trim()) {
           continue;
