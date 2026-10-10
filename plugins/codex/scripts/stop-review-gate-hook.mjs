@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// First import: filters only DEP0190 before any child process is spawned.
+import "./lib/quiet-deprecations.mjs";
 import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";

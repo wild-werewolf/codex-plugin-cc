@@ -192,11 +192,13 @@ Ask Codex to redesign the database connection to be more resilient.
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--write` selects `workspace-write`, otherwise the run is `read-only`. The plugin never asks for full access.
 - when Codex asks for approval is up to your Codex config (`approval_policy`, default `on-request`); the plugin no longer forces `never`.
-- `--approvals <ask|auto-review|deny>` decides who answers those requests: `ask` (default) lets you decide with `/codex:approve`, `auto-review` hands them to Codex's built-in reviewer, `deny` declines them all. Only `--background` runs can wait for you; foreground runs decline and list the requests in the output.
+- `--approvals <ask|auto-review|deny>` decides who answers those requests: `ask` lets you decide, `auto-review` hands them to Codex's built-in reviewer, `deny` declines them all. Without the flag the default from `/codex:setup --default-approvals` applies, and without that the `approvals_reviewer` from your Codex config. Only `--background` runs can wait for you; foreground runs decline and list the requests in the output.
+- with `--background`, Codex runs as a detached job and Claude follows it for you: it starts `watch <job-id>` in the background, asks you about each approval request as it arrives (`Decline (Recommended)` or `Approve once`), and shows `/codex:result` when the job is done. `/codex:approve` does the same for a job you pick yourself.
+- `auto-review` is Codex's built-in reviewer subagent. It decides each request on its own and can decline it; it is not "approve everything". The plugin never requests full access, whichever mode you choose.
 
 ### `/codex:approve`
 
-Shows approval requests from a running background Codex job one at a time and records your answer. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`). The first answer is final, and inside a Claude session only jobs started from that session can be answered.
+Shows approval requests from a running background Codex job one at a time, records your answer, and keeps following the job until it finishes. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`). The first answer is final, and inside a Claude session only jobs started from that session can be answered.
 
 ```bash
 /codex:approve
@@ -265,9 +267,18 @@ Examples:
 Checks whether Codex is installed and authenticated.
 If Codex is missing and npm is available, it can offer to install Codex for you.
 
-It also reports whether the installed Codex app-server protocol matches what the plugin expects (`compatible`, `incompatible`, or `unverified` when the schema cannot be generated). This line is informational and does not change whether setup is ready; run `node scripts/codex-companion.mjs protocol-check` for details.
+It also shows the default approval mode and where it comes from, and reports whether the installed Codex app-server protocol matches what the plugin expects (`compatible`, `incompatible`, or `unverified` when the schema cannot be generated). This line is informational and does not change whether setup is ready; run `node scripts/codex-companion.mjs protocol-check` for details.
 
 You can also use `/codex:setup` to manage the optional review gate.
+
+#### Default approval mode
+
+```bash
+/codex:setup --default-approvals auto-review
+/codex:setup --default-approvals unset
+```
+
+Sets the approval mode (`ask`, `auto-review`, or `deny`) used by `/codex:rescue`, `/codex:review`, and `/codex:adversarial-review` in every repository when you do not pass `--approvals`. It is stored once per user in `${CLAUDE_PLUGIN_DATA}/config.json` (or `config.json` in the plugin's temp-dir state root when `CLAUDE_PLUGIN_DATA` is not set). An explicit `--approvals` always wins; `unset` removes the default so the `approvals_reviewer` from your Codex config applies again. A background job keeps the mode it was started with.
 
 #### Enabling review gate
 

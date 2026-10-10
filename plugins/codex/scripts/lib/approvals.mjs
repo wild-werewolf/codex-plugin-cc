@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { resolveJobsDir } from "./state.mjs";
+import { loadUserConfig, resolveJobsDir, resolveUserConfigFile } from "./state.mjs";
 
 export const APPROVAL_MODES = ["ask", "auto-review", "deny"];
 export const APPROVAL_DECISIONS = ["accept", "decline"];
@@ -47,6 +47,37 @@ export function normalizeApprovalMode(value) {
     throw new Error(`Unsupported approval mode "${value}". Use one of: ${APPROVAL_MODES.join(", ")}.`);
   }
   return normalized;
+}
+
+export const DEFAULT_APPROVALS_CONFIG_KEY = "defaultApprovals";
+
+/**
+ * The per-user default approval mode set with `setup --default-approvals`.
+ * An unreadable or unknown value counts as not set.
+ */
+export function readDefaultApprovalMode() {
+  const value = loadUserConfig()[DEFAULT_APPROVALS_CONFIG_KEY];
+  try {
+    return normalizeApprovalMode(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Effective approval mode: an explicit `--approvals` wins, then the plugin
+ * default, then nothing (Codex's own `approvals_reviewer` config applies).
+ */
+export function resolveApprovalMode(explicit) {
+  const fromFlag = normalizeApprovalMode(explicit);
+  if (fromFlag) {
+    return { mode: fromFlag, source: "flag" };
+  }
+  const fromDefault = readDefaultApprovalMode();
+  if (fromDefault) {
+    return { mode: fromDefault, source: "plugin-default", file: resolveUserConfigFile() };
+  }
+  return { mode: null, source: "codex-config" };
 }
 
 /**

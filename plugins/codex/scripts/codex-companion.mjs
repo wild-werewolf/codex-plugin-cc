@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// First import: filters only DEP0190 before any child process is spawned.
+import "./lib/quiet-deprecations.mjs";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -25,8 +27,12 @@ import {
   createApprovalHandler,
   holdAwaitingApprovalPhase,
   listPendingApprovals,
+  APPROVAL_MODES,
+  DEFAULT_APPROVALS_CONFIG_KEY,
   normalizeApprovalMode,
-  recordApprovalDecision
+  readDefaultApprovalMode,
+  recordApprovalDecision,
+  resolveApprovalMode
 } from "./lib/approvals.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
@@ -38,7 +44,9 @@ import {
   generateJobId,
   getConfig,
   listJobs,
+  resolveUserConfigFile,
   setConfig,
+  setUserConfigValue,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -78,6 +86,9 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+const DEFAULT_WATCH_TIMEOUT_MS = 25 * 60 * 1000;
+const DEFAULT_WATCH_POLL_INTERVAL_MS = 1000;
+const FINISHED_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -86,7 +97,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-approvals <ask|auto-review|deny|unset>] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
@@ -96,6 +107,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "  node scripts/codex-companion.mjs approvals [job-id] [--json]",
       "  node scripts/codex-companion.mjs approve <job-id> <approval-id> --decision <accept|decline> [--json]",
+      "  node scripts/codex-companion.mjs watch <job-id> [--json] [--timeout-ms <ms>] [--poll-interval-ms <ms>]",
       "  node scripts/codex-companion.mjs protocol-check [--json]"
     ].join("\n")
   );
@@ -192,6 +204,15 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
+function describeDefaultApprovals() {
+  const mode = readDefaultApprovalMode();
+  return {
+    mode,
+    source: mode ? "plugin-default" : "codex-config",
+    file: resolveUserConfigFile()
+  };
+}
+
 async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
@@ -224,6 +245,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
+    defaultApprovals: describeDefaultApprovals(),
     protocol,
     actionsTaken,
     nextSteps
@@ -232,12 +254,17 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "default-approvals"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
     throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+  }
+  const defaultApprovals =
+    options["default-approvals"] === undefined ? undefined : String(options["default-approvals"]).trim().toLowerCase();
+  if (defaultApprovals !== undefined && defaultApprovals !== "unset" && !APPROVAL_MODES.includes(defaultApprovals)) {
+    throw new Error(`Unsupported --default-approvals "${options["default-approvals"]}". Use one of: ${APPROVAL_MODES.join(", ")}, unset.`);
   }
 
   const cwd = resolveCommandCwd(options);
@@ -250,6 +277,14 @@ async function handleSetup(argv) {
   } else if (options["disable-review-gate"]) {
     setConfig(workspaceRoot, "stopReviewGate", false);
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
+  }
+
+  if (defaultApprovals === "unset") {
+    setUserConfigValue(DEFAULT_APPROVALS_CONFIG_KEY, undefined);
+    actionsTaken.push("Removed the default approval mode; the approvals_reviewer from your Codex config applies.");
+  } else if (defaultApprovals !== undefined) {
+    setUserConfigValue(DEFAULT_APPROVALS_CONFIG_KEY, defaultApprovals);
+    actionsTaken.push(`Set the default approval mode for all repositories to ${defaultApprovals}.`);
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -772,7 +807,8 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const focusText = positionals.join(" ").trim();
-  const approvalMode = normalizeApprovalMode(options.approvals);
+  // --approvals > `setup --default-approvals` > nothing (Codex config applies).
+  const approvalMode = resolveApprovalMode(options.approvals).mode;
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -833,7 +869,8 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
-  const approvalMode = normalizeApprovalMode(options.approvals);
+  // --approvals > `setup --default-approvals` > nothing (Codex config applies).
+  const approvalMode = resolveApprovalMode(options.approvals).mode;
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -983,6 +1020,65 @@ function handleApprove(argv) {
   const record = recordApprovalDecision(workspaceRoot, jobId, approvalId, String(options.decision).trim().toLowerCase());
   const rendered = `Recorded ${record.decision} for ${approvalId} (job ${jobId}).\n`;
   outputCommandResult({ jobId, ...record }, rendered, options.json);
+}
+
+function renderWatchEvent(event) {
+  if (event.event === "approval") {
+    const lines = [`Codex job ${event.jobId} is waiting for approval:`];
+    for (const entry of event.pending) {
+      lines.push(`- ${entry.approvalId}: ${entry.summary}`);
+    }
+    lines.push(`Answer with /codex:approve ${event.jobId}.`);
+    return `${lines.join("\n")}\n`;
+  }
+  if (event.event === "done") {
+    return `Codex job ${event.jobId} finished: ${event.status}. Show the output with /codex:result ${event.jobId}.\n`;
+  }
+  return `Codex job ${event.jobId} is still running; run watch again to keep following it.\n`;
+}
+
+/**
+ * Follow a job until something needs attention: an approval request is
+ * waiting, the job finished, or the timeout passed. Prints one event.
+ */
+async function handleWatch(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json"]
+  });
+
+  const jobId = positionals[0];
+  if (!jobId) {
+    throw new Error("Usage: watch <job-id> [--json] [--timeout-ms <ms>] [--poll-interval-ms <ms>]");
+  }
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const timeoutMs = Math.max(0, Number(options["timeout-ms"]) || DEFAULT_WATCH_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(50, Number(options["poll-interval-ms"]) || DEFAULT_WATCH_POLL_INTERVAL_MS);
+  const deadline = Date.now() + timeoutMs;
+
+  let event = null;
+  for (;;) {
+    const job = listJobs(workspaceRoot).find((candidate) => candidate.id === jobId);
+    if (!job) {
+      throw new Error(`No Codex job "${jobId}". Run /codex:status to list known jobs.`);
+    }
+    if (FINISHED_JOB_STATUSES.has(job.status)) {
+      event = { event: "done", jobId, status: job.status };
+      break;
+    }
+    const pending = listPendingApprovals(workspaceRoot, jobId);
+    if (pending.length > 0) {
+      event = { event: "approval", jobId, pending };
+      break;
+    }
+    if (Date.now() >= deadline) {
+      event = { event: "timeout", jobId };
+      break;
+    }
+    await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+  }
+
+  outputResult(options.json ? `${JSON.stringify(event)}\n` : renderWatchEvent(event), false);
 }
 
 function handleProtocolCheck(argv) {
@@ -1184,6 +1280,9 @@ async function main() {
       break;
     case "approve":
       handleApprove(argv);
+      break;
+    case "watch":
+      await handleWatch(argv);
       break;
     case "protocol-check":
       handleProtocolCheck(argv);

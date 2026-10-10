@@ -92,7 +92,7 @@ test("rescue command absorbs continue semantics", () => {
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
-  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent/);
+  assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent,\s*Skill/);
   // Regression for #234: `Skill(codex:rescue)` from the main agent recursed
   // because rescue.md named the routing with ambiguous prose ("Route this
   // request to the `codex:codex-rescue` subagent") while running under
@@ -110,9 +110,17 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(rescue, /AskUserQuestion/);
   assert.match(rescue, /Continue current Codex thread/);
   assert.match(rescue, /Start a new Codex thread/);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the background/i);
+  // --background is a companion job (the only kind that can wait for
+  // approvals); the subagent itself runs in the foreground and the main
+  // thread follows the job with `watch`.
+  assert.match(rescue, /Keep `--background` in the forwarded request so the subagent passes it to `task`/i);
+  assert.match(rescue, /run the `codex:codex-rescue` subagent in the foreground \(do not set `run_in_background` on the `Agent` call\)/i);
+  assert.doesNotMatch(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
-  assert.match(rescue, /Do not forward them to `task`/i);
+  assert.match(rescue, /`--wait` is not forwarded to `task`/i);
+  assert.match(rescue, /`codex:codex-approvals` skill/);
+  assert.match(rescue, /watch <job-id> --json/);
+  assert.match(rescue, /run_in_background: true/);
   assert.match(rescue, /`--model` and `--effort` are runtime-selection flags/i);
   assert.match(rescue, /Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort/i);
   assert.match(rescue, /If they ask for `spark`, map it to `gpt-5\.3-codex-spark`/i);
@@ -149,8 +157,9 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(runtimeSkill, /Leave `--effort` unset unless the user explicitly requests a specific effort/i);
   assert.match(runtimeSkill, /Leave model unset by default/i);
   assert.match(runtimeSkill, /Map `spark` to `--model gpt-5\.3-codex-spark`/i);
-  assert.match(runtimeSkill, /If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only/i);
-  assert.match(runtimeSkill, /Strip it before calling `task`/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--background`, pass `--background` to `task`/i);
+  assert.match(runtimeSkill, /If the forwarded request includes `--wait`, strip it before calling `task`/i);
+  assert.match(agent, /If the request includes `--background`, pass `--background` to `task`/i);
   assert.match(runtimeSkill, /`--effort`: accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`/i);
   assert.match(runtimeSkill, /Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own/i);
   assert.match(runtimeSkill, /If the Bash call fails or Codex cannot be invoked, return nothing/i);
@@ -215,7 +224,7 @@ test("setup command can offer Codex install and still points users to codex logi
   const setup = read("commands/setup.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
 
-  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\]'/);
+  assert.match(setup, /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--default-approvals ask\|auto-review\|deny\|unset\]'/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);

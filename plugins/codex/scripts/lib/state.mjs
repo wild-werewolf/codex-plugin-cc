@@ -188,6 +188,55 @@ export function setConfig(cwd, key, value) {
   });
 }
 
+// Per-user settings shared by every repository, e.g. the default approval
+// mode. Lives next to the per-repository state roots, not inside one.
+const USER_CONFIG_FILE_NAME = "config.json";
+
+export function resolveUserConfigFile() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return path.join(pluginDataDir || FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME);
+}
+
+function ownedByAnotherUser(filePath) {
+  // The fallback root is in the shared temp dir; ignore a file planted there
+  // by another local account.
+  if (typeof process.getuid !== "function") {
+    return false;
+  }
+  try {
+    return fs.statSync(filePath).uid !== process.getuid();
+  } catch {
+    return false;
+  }
+}
+
+export function loadUserConfig() {
+  const filePath = resolveUserConfigFile();
+  if (!fs.existsSync(filePath) || ownedByAnotherUser(filePath)) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Set (or, with `undefined`, remove) one per-user setting; written atomically. */
+export function setUserConfigValue(key, value) {
+  const filePath = resolveUserConfigFile();
+  const next = { ...loadUserConfig() };
+  if (value === undefined) {
+    delete next[key];
+  } else {
+    next[key] = value;
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  writeFileAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
 export function getConfig(cwd) {
   return loadState(cwd).config;
 }

@@ -307,11 +307,15 @@ test("protocol check accepts a compatible schema and flags drift", () => {
 
 test("the approve command asks the user about each request and defaults to decline", () => {
   const source = fs.readFileSync(path.join(ROOT, "plugins", "codex", "commands", "approve.md"), "utf8");
+  const rules = fs.readFileSync(path.join(ROOT, "plugins", "codex", "skills", "codex-approvals", "SKILL.md"), "utf8");
   assert.match(source, /disable-model-invocation: true/);
-  assert.match(source, /allowed-tools: Bash\(node:\*\), AskUserQuestion/);
-  assert.match(source, /Decline \(Recommended\)/);
-  assert.match(source, /Approve once/);
-  assert.doesNotMatch(source, /acceptForSession|--decision accept\b(?!\|)/);
+  assert.match(source, /allowed-tools: Bash\(node:\*\), AskUserQuestion, Skill/);
+  assert.match(source, /`codex:codex-approvals` skill/);
+  assert.match(rules, /Decline \(Recommended\)/);
+  assert.match(rules, /Approve once/);
+  for (const text of [source, rules]) {
+    assert.doesNotMatch(text, /acceptForSession|--decision accept\b(?!\|)/);
+  }
 });
 
 // --- runtime: fake app-server -------------------------------------------------

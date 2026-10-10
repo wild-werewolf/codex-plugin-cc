@@ -124,7 +124,8 @@ function buildPermissionResult(params) {
   const type = BEHAVIOR === "sandbox-escalated" ? "dangerFullAccess" : SANDBOX_TYPES[params.sandbox || "read-only"];
   return {
     approvalPolicy: params.approvalPolicy || "on-request",
-    approvalsReviewer: params.approvalsReviewer || "user",
+    // "reviewer-ignored": a server that applies its own reviewer regardless.
+    approvalsReviewer: BEHAVIOR === "reviewer-ignored" ? "user" : params.approvalsReviewer || "user",
     sandbox: { type, networkAccess: false }
   };
 }
@@ -166,6 +167,8 @@ const APPROVAL_SCENARIOS = {
   "approval-before-turn-response": { order: "before", build: commandApprovalRequest },
   "approval-with-turn-response": { order: "same-chunk", build: commandApprovalRequest },
   "approval-resolved": { order: "after", resolveAfterMs: 1500, build: commandApprovalRequest },
+  // The app-server dies while the request is still waiting for an answer.
+  "approval-then-exit": { order: "after", exitAfterMs: 300, build: commandApprovalRequest },
   "approval-permissions": {
     order: "after",
     build: (thread, turnId) => ({
@@ -574,7 +577,9 @@ rl.on("line", (line) => {
 	            send({ method: "item/completed", params: { threadId: thread.id, turnId, item: { type: "agentMessage", id: "msg_" + turnId, text, phase: "final_answer" } } });
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
 	          };
-	          if (approvalScenario.resolveAfterMs) {
+	          if (approvalScenario.exitAfterMs) {
+	            setTimeout(() => process.exit(1), approvalScenario.exitAfterMs);
+	          } else if (approvalScenario.resolveAfterMs) {
 	            // Codex closes the request itself (e.g. the turn moved on) and
 	            // finishes the turn without waiting for the client.
 	            setTimeout(() => {
