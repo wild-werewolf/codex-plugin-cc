@@ -3,7 +3,7 @@
 ## 1.0.6-approvals.3
 
 - `/codex:rescue` calls the `Agent` tool with `run_in_background: false` in every mode. The tool runs subagents in the background when the parameter is left out, so `--background` jobs reached the user only after a notification instead of within seconds. If the subagent still returns through a notification, Claude now starts `watch` right away from the launch line in it (also in the `codex-approvals` skill).
-- The per-user default approval mode moved out of `CLAUDE_PLUGIN_DATA`, whose directory is named after the plugin *and* its marketplace and is removed on uninstall. It now lives in `%APPDATA%\codex-companion\config.json` on Windows and `${XDG_CONFIG_HOME:-~/.config}/codex-companion/config.json` elsewhere, or in `CODEX_COMPANION_CONFIG_FILE`. An old `${CLAUDE_PLUGIN_DATA}/config.json` is still read until the next write moves its values over; the old file is kept. `/codex:setup` shows the actual file and says when the value comes from the old location.
+- The per-user default approval mode moved out of `CLAUDE_PLUGIN_DATA`, whose directory is named after the plugin *and* its marketplace and is removed on uninstall. It now lives in `%APPDATA%\codex-companion\config.json` on Windows and `${XDG_CONFIG_HOME:-~/.config}/codex-companion/config.json` elsewhere, or in `CODEX_COMPANION_CONFIG_FILE`. An old `${CLAUDE_PLUGIN_DATA}/config.json`, or else the newest `config.json` of another installation's data directory next to it (`codex-openai-codex`, ...), is still read until the next write moves its values over; the old file is kept. `/codex:setup` shows the actual file and says when the value comes from the old location.
 
 ## 1.0.6-approvals.2
 

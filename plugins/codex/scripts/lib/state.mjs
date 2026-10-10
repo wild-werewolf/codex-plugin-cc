@@ -206,22 +206,56 @@ export function resolveUserConfigFile(options = {}) {
   const platform = options.platform ?? process.platform;
   const homedir = options.homedir ?? os.homedir();
   if (env[USER_CONFIG_FILE_ENV]) {
-    return platform === "win32" ? path.win32.resolve(env[USER_CONFIG_FILE_ENV]) : path.resolve(env[USER_CONFIG_FILE_ENV]);
+    return platform === "win32" ? path.win32.resolve(env[USER_CONFIG_FILE_ENV]) : path.posix.resolve(env[USER_CONFIG_FILE_ENV]);
   }
   if (platform === "win32") {
     const appData = env.APPDATA || path.win32.join(homedir, "AppData", "Roaming");
     return path.win32.join(appData, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME);
   }
-  // XDG: a relative XDG_CONFIG_HOME is invalid and must be ignored.
-  const configHome = env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(homedir, ".config");
-  return path.join(configHome, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME);
+  // XDG: a relative XDG_CONFIG_HOME is invalid and must be ignored. Use POSIX
+  // path rules for a POSIX platform even when evaluated on a Windows host.
+  const configHome =
+    env.XDG_CONFIG_HOME && path.posix.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.posix.join(homedir, ".config");
+  return path.posix.join(configHome, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME);
 }
 
-/** Where releases up to 1.0.6-approvals.2 kept the per-user settings. */
+// Data directories of other installations of this plugin sit next to the
+// current one, named `<plugin>-<marketplace>` (codex-openai-codex,
+// codex-wild-codex, ...). Newest config.json first; only ever read.
+function siblingInstallConfigFiles(pluginDataDir) {
+  const parent = path.dirname(pluginDataDir);
+  const own = path.basename(pluginDataDir);
+  let names;
+  try {
+    names = fs.readdirSync(parent);
+  } catch {
+    return [];
+  }
+  return names
+    .filter((name) => name.startsWith("codex-") && name !== own)
+    .map((name) => path.join(parent, name, USER_CONFIG_FILE_NAME))
+    .map((file) => {
+      try {
+        return { file, mtimeMs: fs.statSync(file).mtimeMs };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .map((entry) => entry.file);
+}
+
+/**
+ * Where releases up to 1.0.6-approvals.2 kept the per-user settings: this
+ * installation's CLAUDE_PLUGIN_DATA, other installations' data directories
+ * next to it, then the temp-dir fallback.
+ */
 export function resolveLegacyUserConfigFiles(env = process.env) {
   const files = [];
   if (env[PLUGIN_DATA_ENV]) {
     files.push(path.join(env[PLUGIN_DATA_ENV], USER_CONFIG_FILE_NAME));
+    files.push(...siblingInstallConfigFiles(env[PLUGIN_DATA_ENV]));
   }
   files.push(path.join(FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME));
   return files;

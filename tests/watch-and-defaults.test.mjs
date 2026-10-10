@@ -63,7 +63,7 @@ function watch(repo, env, jobId, extra = []) {
 
 function parseEvent(result) {
   assert.equal(result.status, 0, result.stderr);
-  const lines = result.stdout.trim().split("\n");
+  const lines = result.stdout.trim().split(/\r?\n/);
   assert.equal(lines.length, 1, "watch prints exactly one line");
   return JSON.parse(lines[0]);
 }
@@ -203,7 +203,8 @@ test("entry points filter DEP0190 and keep other warnings", () => {
 
   for (const entry of ["codex-companion.mjs", "app-server-broker.mjs", "session-lifecycle-hook.mjs", "stop-review-gate-hook.mjs"]) {
     const source = fs.readFileSync(path.join(PLUGIN_ROOT, "scripts", entry), "utf8");
-    const firstImport = source.split("\n").find((line) => line.startsWith("import "));
+    // Windows checkouts with core.autocrlf=true have CRLF line endings.
+    const firstImport = source.split(/\r?\n/).find((line) => line.startsWith("import "));
     assert.equal(firstImport, 'import "./lib/quiet-deprecations.mjs";', `${entry} must load the filter first`);
   }
 });
@@ -317,4 +318,33 @@ test("a default from the old CLAUDE_PLUGIN_DATA config.json is read and moved on
   run("node", [SCRIPT, "setup", "--default-approvals", "unset"], { cwd: repo, env: legacyEnv });
   assert.equal(JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout).defaultApprovals.mode, null);
   assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { somethingElse: 1 });
+});
+
+test("a default left in another installation's data directory is found and moved on the next write", () => {
+  const { repo, env, configFile, statePath } = setupWithoutOverride();
+  const dataRoot = path.join(makeTempDir(), "plugins", "data");
+  const wildData = path.join(dataRoot, "codex-wild-codex");
+  fs.mkdirSync(wildData, { recursive: true });
+  const openaiFile = path.join(dataRoot, "codex-openai-codex", "config.json");
+  const olderFile = path.join(dataRoot, "codex-older-marketplace", "config.json");
+  const unrelatedFile = path.join(dataRoot, "other-plugin-x", "config.json");
+  for (const [file, value] of [[olderFile, "deny"], [openaiFile, "auto-review"], [unrelatedFile, "ask"]]) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ defaultApprovals: value }));
+  }
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(olderFile, old, old);
+
+  const wildEnv = { ...env, CLAUDE_PLUGIN_DATA: wildData };
+  assert.deepEqual(resolveLegacyUserConfigFiles(wildEnv).slice(0, 3), [path.join(wildData, "config.json"), openaiFile, olderFile]);
+
+  const report = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
+  assert.deepEqual(report.defaultApprovals, { mode: "auto-review", source: "plugin-default-legacy", file: openaiFile, configFile });
+  assert.equal(run("node", [SCRIPT, "task", "look around"], { cwd: repo, env: wildEnv }).status, 0);
+  assert.equal(readFakeState(statePath).lastThreadStart.approvalsReviewer, "auto_review");
+  assert.equal(fs.existsSync(path.join(wildData, "config.json")), false, "reading does not write");
+
+  run("node", [SCRIPT, "setup", "--default-approvals", "auto-review"], { cwd: repo, env: wildEnv });
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(openaiFile, "utf8")), { defaultApprovals: "auto-review" }, "the old file is kept");
 });
