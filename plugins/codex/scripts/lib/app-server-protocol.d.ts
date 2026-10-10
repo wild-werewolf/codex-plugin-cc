@@ -54,6 +54,13 @@ export interface CodexAppServerClientOptions {
   brokerEndpoint?: string;
   disableBroker?: boolean;
   reuseExistingBroker?: boolean;
+  /** Tests only: apply this platform's app-server launch rules (args, env). */
+  platform?: NodeJS.Platform;
+  /** Tests only: replaces the PowerShell 7 lookup for the app-server env. */
+  findPwsh?: (options: { platform?: string; env?: Record<string, string | undefined> }) =>
+    | { status: "found"; path: string; directory: string; version: string; source: "env" | "path" | "program-files" | "codex-runtime" }
+    | { status: "not-found"; rejected: { path: string; reason: string }[] }
+    | null;
 }
 
 export interface AppServerMethodMap {

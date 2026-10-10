@@ -271,7 +271,7 @@ It also shows the default approval mode and where it comes from, and reports whe
 
 You can also use `/codex:setup` to manage the optional review gate.
 
-On Windows it also shows which Windows sandbox the plugin asks Codex to use (see below). This line is informational too.
+On Windows it also shows which Windows sandbox the plugin asks Codex to use and which PowerShell 7 the Codex app-server will find first (see below). These lines are informational too.
 
 #### Windows sandbox (MXC)
 
@@ -283,6 +283,27 @@ To choose differently, set `CODEX_COMPANION_WINDOWS_SANDBOX` in the environment 
 - `mxc`, `elevated`, or `unelevated`: pass that value instead.
 
 Any other value is an error. The variable is ignored on macOS and Linux, where the plugin keeps running `codex app-server`. A shared runtime that is already running keeps the setting it was started with until the Claude session ends.
+
+#### PowerShell 7 on Windows
+
+Codex runs commands in the first `pwsh` it finds on `PATH`, then `C:\Program Files\PowerShell\7\pwsh.exe`, then Windows PowerShell 5.1 (`powershell.exe`). Windows PowerShell 5.1 prints startup messages, such as an `InitializeDefaultDrives` error for an unavailable network drive, in the console code page before the command switches its output to UTF-8, so they arrive garbled. In PowerShell 7 they stay readable (the message itself can still appear; the plugin does not hide it).
+
+Before it starts `codex app-server` (directly or in the shared runtime), the plugin looks for a usable PowerShell 7 and puts its directory first on `PATH` in the environment of that process only. The global `PATH`, your PowerShell profiles and `~/.codex/config.toml` are not changed, and nothing is installed or downloaded. It looks, in this order, at:
+
+1. `CODEX_COMPANION_PWSH`, if set: the full path of `pwsh.exe`;
+2. every `pwsh.exe` on `PATH`, in `PATH` order;
+3. `%ProgramFiles%\PowerShell\7\pwsh.exe` (and `%ProgramW6432%`), the MSI and winget install directory;
+4. the PowerShell bundled with Codex's managed runtime, `%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\native\powershell\pwsh.exe`.
+
+A candidate is used only if it is a `pwsh.exe` Windows executable (not `powershell.exe`, not a `.cmd`/`.ps1` shim), is not the Microsoft Store PowerShell or its App Execution Alias (the Windows sandbox cannot start those; other packages under `WindowsApps` are fine), and `pwsh.exe -Version` reports 7 or later within 5 seconds.
+
+If none qualifies, the plugin keeps Codex's own choice, which may be Windows PowerShell 5.1, and prints a warning; `/codex:setup` shows the candidates it skipped and why. Install PowerShell 7 with the MSI or `winget install --id Microsoft.PowerShell --source winget` (not from the Store), or point the plugin at one:
+
+```powershell
+setx CODEX_COMPANION_PWSH "C:\path\to\PowerShell\7\pwsh.exe"
+```
+
+then restart Claude Code. A `CODEX_COMPANION_PWSH` that does not point to a usable PowerShell 7 is an error, with no fallback. The variable is ignored on macOS and Linux. A shared runtime that is already running keeps the PowerShell it was started with until the Claude session ends.
 
 #### Default approval mode
 

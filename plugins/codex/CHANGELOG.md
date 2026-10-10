@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6-approvals.5
+
+- On Windows the companion looks for a usable PowerShell 7 before it starts `codex app-server` and puts its directory first on `PATH` in that process's environment only, so Codex's shell detection (`pwsh` on `PATH` first) uses it instead of Windows PowerShell 5.1, whose startup messages (such as `InitializeDefaultDrives` errors) are printed in the console code page before the command switches to UTF-8 and arrive garbled. Order: `CODEX_COMPANION_PWSH`, `pwsh.exe` on `PATH` in order, `%ProgramFiles%\PowerShell\7`, Codex's managed runtime under `%USERPROFILE%\.cache\codex-runtimes`. Each candidate must be a `pwsh.exe` executable outside the Store PowerShell package and its App Execution Alias (other `WindowsApps` packages are allowed) whose `-Version` reports 7+ within 5 s. Direct and shared-broker runtimes alike; the broker's own environment, the global `PATH`, profiles and `~/.codex/config.toml` are unchanged, and the MXC override, approvals and sandbox modes stay as they were.
+- Without a usable PowerShell 7 Codex keeps its own choice and the companion prints a warning with how to set `CODEX_COMPANION_PWSH`. A set `CODEX_COMPANION_PWSH` that is not usable is an error. Ignored on macOS and Linux.
+- `/codex:setup` shows the PowerShell found or the candidates skipped (`windowsPowerShell` in `--json`, Windows only, informational).
+
 ## 1.0.6-approvals.4
 
 - On Windows the companion starts `codex -c windows.sandbox=mxc app-server` (direct and shared-broker runtimes alike). With the legacy `elevated` sandbox, Codex's per-command "setup refresh" fails while `node_repl.exe` is running (`os error 32`, [openai/codex#51822](https://github.com/openai/codex/pull/51822)), and every command was rejected with `helper_unknown_error: setup refresh had errors`. The override is per process; `~/.codex/config.toml` is untouched. `CODEX_COMPANION_WINDOWS_SANDBOX=config` passes no override, `mxc`/`elevated`/`unelevated` pass that value, anything else is an error. No fallback to another sandbox, and approval policy, reviewer and the thread sandbox are unchanged. Other platforms still run `codex app-server`.

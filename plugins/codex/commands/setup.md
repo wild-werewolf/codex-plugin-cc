@@ -36,3 +36,4 @@ Output rules:
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
 - Show the `defaultApprovals` value and where it comes from: a plugin default (`mode` and the actual `file`), a plugin default still read from the old location (`source: plugin-default-legacy`; the next `--default-approvals` change saves it to `configFile`), or not set, in which case the `approvals_reviewer` from the user's Codex config applies.
+- On Windows, if `windowsPowerShell.status` is `not-found` or `invalid`, keep the guidance about `CODEX_COMPANION_PWSH` and do not say that the garbled PowerShell startup messages are fixed.

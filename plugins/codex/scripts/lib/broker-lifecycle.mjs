@@ -128,6 +128,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
     clearBrokerSession(cwd);
   }
 
+  // Checks that must pass before a new broker is started; may throw.
+  options.beforeSpawn?.();
+
   const sessionDir = createBrokerSessionDir();
   const endpointFactory = options.createBrokerEndpoint ?? createBrokerEndpoint;
   const endpoint = endpointFactory(sessionDir, options.platform);

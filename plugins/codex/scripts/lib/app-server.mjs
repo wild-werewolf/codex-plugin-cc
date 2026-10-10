@@ -16,6 +16,7 @@ import { failClosedServerRequestResult } from "./approvals.mjs";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
+import { formatPwshNotFoundWarning, prependPathDirectory, resolveCompatiblePwsh } from "./windows-powershell.mjs";
 
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
@@ -123,6 +124,46 @@ export function buildAppServerSpawnArgs({ platform = process.platform, env = pro
     return ["app-server"];
   }
   return ["-c", `windows.sandbox=${sandbox.mode}`, "app-server"];
+}
+
+let pwshWarningShown = false;
+
+function warnOncePerProcess(message) {
+  if (pwshWarningShown) {
+    return;
+  }
+  pwshWarningShown = true;
+  process.stderr.write(`${message}\n`);
+}
+
+/**
+ * Environment for the `codex` process that runs the app-server. On Windows a
+ * usable PowerShell 7 goes first on its PATH, so Codex's shell detection
+ * (`pwsh` on PATH first) picks it instead of Windows PowerShell 5.1; the rest
+ * of the environment and the original PATH are kept. Without one, env is
+ * returned as is and a warning explains how to point the plugin at pwsh.exe.
+ * An unusable CODEX_COMPANION_PWSH throws. Other platforms: env unchanged.
+ *
+ * @param {{ platform?: string, env?: Record<string, string | undefined>, findPwsh?: typeof resolveCompatiblePwsh, warn?: (message: string) => void }} [options]
+ * @returns {Record<string, string | undefined>}
+ */
+export function buildAppServerSpawnEnv({
+  platform = process.platform,
+  env = process.env,
+  findPwsh = resolveCompatiblePwsh,
+  warn = warnOncePerProcess
+} = {}) {
+  if (platform !== "win32") {
+    return env;
+  }
+  const pwsh = findPwsh({ platform, env });
+  if (pwsh?.status === "found") {
+    return prependPathDirectory(env, pwsh.directory);
+  }
+  if (pwsh?.status === "not-found") {
+    warn(formatPwshNotFoundWarning(pwsh));
+  }
+  return env;
 }
 
 class AppServerClientBase {
@@ -293,8 +334,16 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    const env = this.options.env ?? process.env;
-    this.proc = spawn("codex", buildAppServerSpawnArgs({ env }), {
+    const baseEnv = this.options.env ?? process.env;
+    // `platform` and `findPwsh` only let tests apply the Windows launch rules.
+    const platform = this.options.platform ?? process.platform;
+    const args = buildAppServerSpawnArgs({ platform, env: baseEnv });
+    const env = buildAppServerSpawnEnv({
+      platform,
+      env: baseEnv,
+      ...(this.options.findPwsh ? { findPwsh: this.options.findPwsh } : {})
+    });
+    this.proc = spawn("codex", args, {
       cwd: this.cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -454,7 +503,16 @@ export class CodexAppServerClient {
         // Reject an unsupported CODEX_COMPANION_WINDOWS_SANDBOX here rather
         // than after the broker failed to start its app-server.
         buildAppServerSpawnArgs({ env: options.env ?? process.env });
-        const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
+        const brokerSession = await ensureBrokerSession(cwd, {
+          env: options.env,
+          // Only when a new broker is started: an unusable CODEX_COMPANION_PWSH
+          // or a missing PowerShell 7 is reported here, where the user sees it,
+          // not only in the broker log. The broker's own app-server gets the
+          // same PATH from buildAppServerSpawnEnv; the broker's env is unchanged.
+          beforeSpawn: () => {
+            buildAppServerSpawnEnv({ env: options.env ?? process.env });
+          }
+        });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }
     }

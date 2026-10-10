@@ -189,6 +189,28 @@ function renderWindowsSandboxLine(windowsSandbox) {
     : `- windows sandbox: ${windowsSandbox.mode} (plugin default; set CODEX_COMPANION_WINDOWS_SANDBOX=config to use your Codex config)`;
 }
 
+const PWSH_SOURCE_LABELS = {
+  env: "CODEX_COMPANION_PWSH",
+  path: "from PATH",
+  "program-files": "standard install directory",
+  "codex-runtime": "Codex runtime"
+};
+
+function renderWindowsPowerShellLine(windowsPowerShell) {
+  if (windowsPowerShell.status === "invalid") {
+    return `- powershell: invalid (${windowsPowerShell.error})`;
+  }
+  if (windowsPowerShell.status === "found") {
+    const source = PWSH_SOURCE_LABELS[windowsPowerShell.source] ?? windowsPowerShell.source;
+    return `- powershell: ${windowsPowerShell.version} at ${windowsPowerShell.path} (${source}; first on the app-server PATH)`;
+  }
+  const skipped = (windowsPowerShell.rejected ?? []).map((entry) => `${entry.path}: ${entry.reason}`);
+  return (
+    "- powershell: no PowerShell 7 found; Codex keeps its own choice and may use Windows PowerShell 5.1 (startup messages can appear garbled)" +
+    (skipped.length > 0 ? `; skipped ${skipped.join("; ")}` : "")
+  );
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -212,6 +234,7 @@ export function renderSetupReport(report) {
         ]
       : []),
     ...(report.windowsSandbox ? [renderWindowsSandboxLine(report.windowsSandbox)] : []),
+    ...(report.windowsPowerShell ? [renderWindowsPowerShellLine(report.windowsPowerShell)] : []),
     ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
     ""
   ];

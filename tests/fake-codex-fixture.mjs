@@ -317,6 +317,10 @@ function structuredReviewPayload(prompt) {
 }
 
 function taskPayload(prompt, resume) {
+  if (BEHAVIOR === "utf8-answer") {
+    return "Ответ: кириллица, ё и тире — без искажений.";
+  }
+
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
@@ -369,6 +373,12 @@ const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
 // The full argument list of every app-server start, in order.
 bootState.appServerArgs = [...(bootState.appServerArgs || []), argv];
+// What each app-server start saw of its environment: PATH (where Codex looks
+// for pwsh first) and a marker variable that must pass through unchanged.
+bootState.appServerEnv = [
+  ...(bootState.appServerEnv || []),
+  { PATH: process.env.PATH ?? null, marker: process.env.CODEX_TEST_ENV_MARKER ?? null }
+];
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });
