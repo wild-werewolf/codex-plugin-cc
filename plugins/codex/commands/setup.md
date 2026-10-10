@@ -1,6 +1,6 @@
 ---
-description: Check whether the local Codex CLI is ready, optionally toggle the stop-time review gate, and set the default approval mode
-argument-hint: '[--enable-review-gate|--disable-review-gate] [--default-approvals ask|auto-review|deny|unset]'
+description: Check whether the local Codex CLI is ready, optionally toggle the stop-time review gate, and set the default approval mode and approval timeout
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--default-approvals ask|auto-review|deny|unset] [--approval-timeout <minutes>|unset]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
@@ -36,4 +36,5 @@ Output rules:
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
 - Show the `defaultApprovals` value and where it comes from: a plugin default (`mode` and the actual `file`), a plugin default still read from the old location (`source: plugin-default-legacy`; the next `--default-approvals` change saves it to `configFile`), or not set, in which case the `approvals_reviewer` from the user's Codex config applies.
+- Show the `approvalTimeout` value in minutes and where it comes from: the default (15 minutes), the plugin setting (`file`), or `CODEX_COMPANION_APPROVAL_TIMEOUT_MS` (`source: env`), which overrides `--approval-timeout`.
 - On Windows, if `windowsPowerShell.status` is `not-found` or `invalid`, keep the guidance about `CODEX_COMPANION_PWSH` and do not say that the garbled PowerShell startup messages are fixed.

@@ -10,7 +10,29 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+// How long the shared broker (and its `codex app-server` with its MCP
+// servers) stays up with nothing to do; 0 keeps it until SessionEnd.
+export const BROKER_IDLE_ENV = "CODEX_COMPANION_BROKER_IDLE_MS";
+export const DEFAULT_BROKER_IDLE_MS = 5 * 60 * 1000;
 const BROKER_STATE_FILE = "broker.json";
+
+/**
+ * Idle timeout of the shared broker in milliseconds: CODEX_COMPANION_BROKER_IDLE_MS
+ * when it is a non-negative integer (0 = never exit on idle), else 5 minutes.
+ *
+ * @returns {{ idleMs: number, source: "default" | "env", invalid?: string }}
+ */
+export function resolveBrokerIdleMs(env = process.env) {
+  const raw = env?.[BROKER_IDLE_ENV];
+  if (raw === undefined || String(raw).trim() === "") {
+    return { idleMs: DEFAULT_BROKER_IDLE_MS, source: "default" };
+  }
+  const value = String(raw).trim();
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(Number(value))) {
+    return { idleMs: DEFAULT_BROKER_IDLE_MS, source: "default", invalid: value };
+  }
+  return { idleMs: Number(value), source: "env" };
+}
 
 export function createBrokerSessionDir(prefix = "cxc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -58,12 +80,16 @@ export async function sendBrokerShutdown(endpoint) {
 
 export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(process.execPath, [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile], {
-    cwd,
-    env,
-    detached: true,
-    stdio: ["ignore", logFd, logFd]
-  });
+  const child = spawn(
+    process.execPath,
+    [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--log-file", logFile],
+    {
+      cwd,
+      env,
+      detached: true,
+      stdio: ["ignore", logFd, logFd]
+    }
+  );
   child.unref();
   fs.closeSync(logFd);
   return child;
@@ -96,6 +122,48 @@ export function clearBrokerSession(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (fs.existsSync(stateFile)) {
     fs.unlinkSync(stateFile);
+  }
+}
+
+/**
+ * A client found the broker at `endpoint` gone (it crashed, or exited after
+ * its idle timeout): if broker.json still describes it, remove its leftover
+ * files (pid file, log, Unix socket, session dir) and the record. No process
+ * is killed: the broker is not answering on its endpoint any more.
+ */
+export function forgetDeadBrokerSession(cwd, endpoint) {
+  const session = loadBrokerSession(cwd);
+  if (!session || session.endpoint !== endpoint) {
+    return false;
+  }
+  try {
+    teardownBrokerSession({
+      endpoint: session.endpoint ?? null,
+      pidFile: session.pidFile ?? null,
+      logFile: session.logFile ?? null,
+      sessionDir: session.sessionDir ?? null,
+      pid: null
+    });
+  } catch {
+    // Leftover files are harmless; the record below is what matters.
+  }
+  return clearBrokerSessionIfOwned(cwd, endpoint);
+}
+
+/**
+ * Remove broker.json only while it still describes the broker at `endpoint`
+ * (a newer broker may have replaced it). Returns true when it was removed.
+ */
+export function clearBrokerSessionIfOwned(cwd, endpoint) {
+  const session = loadBrokerSession(cwd);
+  if (!session || session.endpoint !== endpoint) {
+    return false;
+  }
+  try {
+    clearBrokerSession(cwd);
+    return true;
+  } catch {
+    return false;
   }
 }
 

@@ -50,6 +50,30 @@ export function normalizeApprovalMode(value) {
 }
 
 export const DEFAULT_APPROVALS_CONFIG_KEY = "defaultApprovals";
+// `setup --approval-timeout <minutes>`: how long a background job waits for
+// an answer. CODEX_COMPANION_APPROVAL_TIMEOUT_MS still wins over it.
+export const APPROVAL_TIMEOUT_CONFIG_KEY = "approvalTimeoutMinutes";
+export const DEFAULT_APPROVAL_TIMEOUT_MINUTES = DEFAULT_APPROVAL_TIMEOUT_MS / 60000;
+const MAX_APPROVAL_TIMEOUT_MINUTES = 24 * 60;
+
+/**
+ * A timeout in whole minutes, 1 to 1440. `strict` throws on anything else
+ * (setup input); otherwise an invalid stored value counts as not set.
+ */
+export function normalizeApprovalTimeoutMinutes(value, { strict = true } = {}) {
+  if (value == null || value === "") {
+    return null;
+  }
+  const text = String(value).trim();
+  const minutes = Number(text);
+  if (!/^\d+$/.test(text) || minutes < 1 || minutes > MAX_APPROVAL_TIMEOUT_MINUTES) {
+    if (strict) {
+      throw new Error(`Unsupported approval timeout "${value}". Use whole minutes from 1 to ${MAX_APPROVAL_TIMEOUT_MINUTES}, or unset.`);
+    }
+    return null;
+  }
+  return minutes;
+}
 
 /**
  * The per-user default approval mode set with `setup --default-approvals`.
@@ -324,7 +348,7 @@ export function recordApprovalDecision(workspaceRoot, jobId, approvalId, decisio
   }
   const outcome = readJson(approvalFile(workspaceRoot, jobId, approvalId, "outcome"));
   if (outcome) {
-    throw new Error(`Approval ${approvalId} is already closed (${outcome.decision}, ${outcome.source}).`);
+    throw new Error(formatClosedApprovalMessage({ ...request, outcome }));
   }
   const decisionPath = approvalFile(workspaceRoot, jobId, approvalId, "decision");
   const record = {
@@ -341,17 +365,120 @@ export function recordApprovalDecision(workspaceRoot, jobId, approvalId, decisio
     return existing;
   }
   if (existing && existing.decidedBy && existing.decidedBy !== "user") {
-    throw new Error(`Approval ${approvalId} is already closed (${existing.decision}, ${existing.decidedBy}).`);
+    throw new Error(formatClosedApprovalMessage({ ...request, decision: existing }));
   }
   throw new Error(`Approval ${approvalId} was already decided: ${existing?.decision ?? "unknown"}.`);
 }
 
-function resolveTimeoutMs(explicit) {
-  const fromEnv = Number(process.env[APPROVAL_TIMEOUT_ENV]);
-  if (Number.isFinite(explicit) && explicit > 0) {
-    return explicit;
+function formatDuration(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return null;
   }
-  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : DEFAULT_APPROVAL_TIMEOUT_MS;
+  if (ms % 60000 === 0) {
+    return `${ms / 60000} minute${ms === 60000 ? "" : "s"}`;
+  }
+  return ms >= 1000 ? `${Math.round(ms / 1000)} seconds` : `${ms} ms`;
+}
+
+// Sources that close a request without the user's answer: the thread can be
+// continued to retry what Codex wanted to do.
+const UNANSWERED_CLOSE_SOURCES = new Set(["timeout", "resolved-by-server", "closed", "job-ended"]);
+
+/**
+ * How and when an approval request was closed, from its request, decision
+ * and outcome records (as listApprovals returns them). `job` is the job
+ * record; a request with neither decision nor outcome counts as closed when
+ * the job is no longer running.
+ */
+export function describeApprovalClosure(entry, job = null) {
+  const decision = entry?.outcome?.decision ?? entry?.decision?.decision ?? null;
+  let source = entry?.outcome?.source ?? entry?.decision?.decidedBy ?? null;
+  const closedAt = entry?.outcome?.closedAt ?? entry?.decision?.decidedAt ?? null;
+  if (!source && job && job.status !== "running" && job.status !== "queued") {
+    source = "job-ended";
+  }
+  if (!source) {
+    return null;
+  }
+  const at = closedAt ? ` at ${closedAt}` : "";
+  const waitedFor = formatDuration(Date.parse(entry?.expiresAt) - Date.parse(entry?.requestedAt));
+  let detail;
+  switch (source) {
+    case "user":
+      detail = `the user already answered it${at}: ${decision}`;
+      break;
+    case "timeout":
+      detail = `nobody answered it ${waitedFor ? `within ${waitedFor}` : "before the timeout"} (asked at ${entry?.requestedAt}, expired at ${entry?.expiresAt}), so it was declined${at}`;
+      break;
+    case "resolved-by-server":
+      detail = `Codex closed it itself${at} (resolved-by-server) before an answer arrived`;
+      break;
+    case "closed":
+      detail = `the connection to Codex closed${at} before an answer, so it was declined`;
+      break;
+    case "job-ended":
+      detail = `job ${entry?.jobId ?? job?.id} ended (${job?.status}${job?.completedAt ? ` at ${job.completedAt}` : ""}) before it was answered`;
+      break;
+    default:
+      detail = `it was closed${at} (${source})`;
+  }
+  return {
+    approvalId: entry?.approvalId ?? null,
+    summary: entry?.summary ?? null,
+    decision,
+    source,
+    closedAt,
+    requestedAt: entry?.requestedAt ?? null,
+    expiresAt: entry?.expiresAt ?? null,
+    detail,
+    resumable: UNANSWERED_CLOSE_SOURCES.has(source)
+  };
+}
+
+/**
+ * The command that continues the Codex thread to retry a request nobody
+ * answered: a background run, so the new request can be asked about.
+ */
+export function formatApprovalResumeHint(summary) {
+  const what = summary ? `Retry: ${summary}` : "<what Codex should retry>";
+  return `To continue the Codex thread and retry, run: /codex:rescue --background --resume ${what}`;
+}
+
+/** The `approve` error for a request that can no longer be answered. */
+export function formatClosedApprovalMessage(entry, job = null) {
+  const closure = describeApprovalClosure(entry, job);
+  if (!closure) {
+    return `Approval ${entry?.approvalId} is not open.`;
+  }
+  const state =
+    closure.source === "job-ended" ? "can no longer be answered" : `is already closed (${closure.decision}, ${closure.source})`;
+  const lines = [`Approval ${closure.approvalId}${closure.summary ? ` (${closure.summary})` : ""} ${state}: ${closure.detail}.`];
+  if (closure.resumable) {
+    lines.push(formatApprovalResumeHint(closure.summary));
+  }
+  return lines.join("\n");
+}
+
+// Explicit option, then CODEX_COMPANION_APPROVAL_TIMEOUT_MS, then the
+// `setup --approval-timeout` setting, then 15 minutes.
+export function resolveApprovalTimeout(explicit) {
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return { timeoutMs: explicit, source: "option" };
+  }
+  const fromEnv = Number(process.env[APPROVAL_TIMEOUT_ENV]);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) {
+    return { timeoutMs: fromEnv, source: "env" };
+  }
+  const config = readUserConfig();
+  const minutes = normalizeApprovalTimeoutMinutes(config.values[APPROVAL_TIMEOUT_CONFIG_KEY], { strict: false });
+  if (minutes) {
+    return { timeoutMs: minutes * 60000, source: "plugin-default", file: config.file };
+  }
+  return { timeoutMs: DEFAULT_APPROVAL_TIMEOUT_MS, source: "default" };
+}
+
+function resolveTimeoutMs(explicit) {
+  return resolveApprovalTimeout(explicit).timeoutMs;
 }
 
 function requestKey(id) {

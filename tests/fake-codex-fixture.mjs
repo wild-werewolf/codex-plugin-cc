@@ -371,6 +371,8 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+// The pid of every app-server start, in order (tests check they exit).
+bootState.appServerPids = [...(bootState.appServerPids || []), process.pid];
 // The full argument list of every app-server start, in order.
 bootState.appServerArgs = [...(bootState.appServerArgs || []), argv];
 // What each app-server start saw of its environment: PATH (where Codex looks
@@ -749,7 +751,7 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interruptible-slow-task-late-interrupt") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -782,13 +784,22 @@ rl.on("line", (line) => {
 	        if (pending) {
 	          clearTimeout(pending.timer);
 	          interruptibleTurns.delete(message.params.turnId);
-	          send({
-	            method: "turn/completed",
-	            params: {
-	              threadId: pending.threadId,
-	              turn: buildTurn(message.params.turnId, "interrupted")
-	            }
-	          });
+	          const completeInterrupted = () =>
+	            send({
+	              method: "turn/completed",
+	              params: {
+	                threadId: pending.threadId,
+	                turn: buildTurn(message.params.turnId, "interrupted")
+	              }
+	            });
+	          if (BEHAVIOR === "interruptible-slow-task-late-interrupt") {
+	            // Like the real Codex: the interrupt is acknowledged first and
+	            // the turn ends a little later.
+	            send({ id: message.id, result: {} });
+	            setTimeout(completeInterrupted, 1000);
+	            break;
+	          }
+	          completeInterrupted();
 	        }
 	        send({ id: message.id, result: {} });
 	        break;

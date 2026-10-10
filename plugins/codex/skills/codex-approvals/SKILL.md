@@ -41,7 +41,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" approve <jobId> <approv
 
 - `Approve once` maps to `accept`. `Decline`, and any other or missing answer, maps to `decline`.
 - Record only the user's answer. Do not approve on the user's behalf, do not approve several requests with one answer, and do not use any other decision value.
-- If `approve` reports that the request is already closed or expired, or that the job was not started from this Claude session, tell the user. Do not retry it.
+- If `approve` reports that the job was not started from this Claude session, tell the user. Do not retry it.
+- If `approve` reports that the request is already closed or expired (for example `already closed (decline, timeout)`, or the job is already finished), do not retry it and do not stop silently:
+  - tell the user when and how the request was closed, as `approve` says (`timeout`: nobody answered in time; `user`: it was already answered; `resolved-by-server`: Codex closed it; the connection closed or the job ended);
+  - when `approve` prints a `/codex:rescue --background --resume ...` line, Codex was told "declined": offer the user to continue the same Codex thread with that command, adjusted to what they want Codex to retry. Do not start it without the user's go-ahead.
+- When the job's result lists a request declined with `no answer before the timeout`, `closed by Codex` or `the Codex connection closed before an answer`, make the same offer with the `/codex:rescue --background --resume ...` line from the result.
 
 ## Never
 
