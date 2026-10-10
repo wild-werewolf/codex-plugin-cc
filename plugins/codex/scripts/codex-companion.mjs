@@ -35,6 +35,7 @@ import {
   resolveApprovalMode
 } from "./lib/approvals.mjs";
 import { describeWindowsSandbox } from "./lib/app-server.mjs";
+import { PWSH_PATH_ENV, describeWindowsPowerShell } from "./lib/windows-powershell.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -225,6 +226,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const config = getConfig(workspaceRoot);
   // Informational only, Windows only: does not change `ready`.
   const windowsSandbox = describeWindowsSandbox();
+  // Informational only, Windows only: the PowerShell the app-server will find first.
+  const windowsPowerShell = describeWindowsPowerShell();
   // Informational only: protocol drift is reported but does not change `ready`.
   const protocol = codexStatus.available
     ? summarizeProtocolCheck(runProtocolCheck(cwd))
@@ -241,6 +244,13 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (windowsSandbox?.error) {
     nextSteps.push("Set CODEX_COMPANION_WINDOWS_SANDBOX to mxc, elevated, unelevated or config, or unset it.");
   }
+  if (windowsPowerShell?.status === "invalid") {
+    nextSteps.push(`Set ${PWSH_PATH_ENV} to the full path of pwsh.exe (PowerShell 7 or later), or unset it.`);
+  } else if (windowsPowerShell?.status === "not-found") {
+    nextSteps.push(
+      `Install PowerShell 7 with the MSI or winget (not the Microsoft Store version), or set ${PWSH_PATH_ENV} to the full path of pwsh.exe, then restart Claude Code.`
+    );
+  }
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
   }
@@ -255,6 +265,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     reviewGateEnabled: Boolean(config.stopReviewGate),
     defaultApprovals: describeDefaultApprovals(),
     ...(windowsSandbox ? { windowsSandbox } : {}),
+    ...(windowsPowerShell ? { windowsPowerShell } : {}),
     protocol,
     actionsTaken,
     nextSteps

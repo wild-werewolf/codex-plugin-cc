@@ -2408,3 +2408,117 @@ test(
     assert.match(invalid.stderr, /Unsupported CODEX_COMPANION_WINDOWS_SANDBOX="bogus"/);
   }
 );
+
+function readAppServerEnv(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).appServerEnv;
+}
+
+function endSharedSession(repo, env) {
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+}
+
+const UTF8_ANSWER = "Ответ: кириллица, ё и тире — без искажений.";
+const ENV_MARKER = "Маркер ё — 1";
+
+test(
+  "outside Windows the direct and broker app-servers get the caller's PATH, CODEX_COMPANION_PWSH ignored",
+  { skip: process.platform === "win32" ? "Windows changes PATH" : false },
+  () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, "utf8-answer");
+    const extra = { CODEX_COMPANION_PWSH: "not a path", CODEX_TEST_ENV_MARKER: ENV_MARKER };
+
+    const directRepo = setupTaskRepo();
+    const directEnv = directTaskEnv(binDir, extra);
+    const direct = run("node", [SCRIPT, "task", "check direct env"], { cwd: directRepo, env: directEnv });
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.ok(direct.stdout.includes(UTF8_ANSWER), direct.stdout);
+    assert.doesNotMatch(direct.stderr, /PowerShell|CODEX_COMPANION_PWSH/);
+
+    const brokerRepo = setupTaskRepo();
+    const brokerEnv = { ...buildEnv(binDir), ...extra };
+    const broker = run("node", [SCRIPT, "task", "check broker env", "--json"], { cwd: brokerRepo, env: brokerEnv });
+    try {
+      assert.equal(broker.status, 0, broker.stderr);
+      assert.ok(loadBrokerSession(brokerRepo), "the task should start the shared broker");
+      assert.ok(JSON.parse(broker.stdout).rawOutput.includes(UTF8_ANSWER), broker.stdout);
+      assert.doesNotMatch(broker.stderr, /PowerShell|CODEX_COMPANION_PWSH/);
+    } finally {
+      endSharedSession(brokerRepo, brokerEnv);
+    }
+
+    assert.deepEqual(readAppServerEnv(binDir), [
+      { PATH: directEnv.PATH, marker: ENV_MARKER },
+      { PATH: brokerEnv.PATH, marker: ENV_MARKER }
+    ]);
+    assert.deepEqual(readAppServerArgs(binDir), [["app-server"], ["app-server"]]);
+
+    const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: ROOT, env: brokerEnv });
+    assert.equal(setup.status, 0, setup.stderr);
+    assert.equal("windowsPowerShell" in JSON.parse(setup.stdout), false);
+  }
+);
+
+test("a failing task keeps its non-zero exit status with CODEX_COMPANION_PWSH set outside Windows", {
+  skip: process.platform === "win32" ? "the value is validated on Windows" : false
+}, () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "auth-run-fails");
+  const repo = setupTaskRepo();
+
+  const plain = run("node", [SCRIPT, "task", "fail please"], { cwd: repo, env: directTaskEnv(binDir) });
+  const withVar = run("node", [SCRIPT, "task", "fail please"], {
+    cwd: repo,
+    env: directTaskEnv(binDir, { CODEX_COMPANION_PWSH: "C:\\nowhere\\pwsh.exe" })
+  });
+  assert.notEqual(plain.status, 0);
+  assert.equal(withVar.status, plain.status);
+  assert.match(withVar.stderr, /authentication expired/);
+});
+
+// On a real Windows machine: whatever PowerShell 7 the plugin finds there (or
+// none) must be what both runtimes' app-server sees first on PATH.
+test(
+  "on Windows the direct and broker app-servers get the same PowerShell 7 first on PATH",
+  { skip: process.platform === "win32" ? false : "Windows only" },
+  async () => {
+    const { resolveCompatiblePwsh } = await import("../plugins/codex/scripts/lib/windows-powershell.mjs");
+    const binDir = makeTempDir();
+    installFakeCodex(binDir, "utf8-answer");
+
+    const directRepo = setupTaskRepo();
+    const directEnv = directTaskEnv(binDir, { CODEX_TEST_ENV_MARKER: ENV_MARKER });
+    const direct = run("node", [SCRIPT, "task", "check direct env"], { cwd: directRepo, env: directEnv });
+    assert.equal(direct.status, 0, direct.stderr);
+    assert.ok(direct.stdout.includes(UTF8_ANSWER), direct.stdout);
+
+    const brokerRepo = setupTaskRepo();
+    const brokerEnv = { ...buildEnv(binDir), CODEX_TEST_ENV_MARKER: ENV_MARKER };
+    const broker = run("node", [SCRIPT, "task", "check broker env"], { cwd: brokerRepo, env: brokerEnv });
+    try {
+      assert.equal(broker.status, 0, broker.stderr);
+      assert.ok(broker.stdout.includes(UTF8_ANSWER), broker.stdout);
+    } finally {
+      endSharedSession(brokerRepo, brokerEnv);
+    }
+
+    const pwsh = resolveCompatiblePwsh({ platform: "win32", env: brokerEnv });
+    const seen = readAppServerEnv(binDir);
+    assert.equal(seen.length, 2);
+    for (const [index, entry] of seen.entries()) {
+      const original = index === 0 ? directEnv.PATH : brokerEnv.PATH;
+      assert.equal(entry.marker, ENV_MARKER);
+      assert.equal(entry.PATH, pwsh.status === "found" ? `${pwsh.directory};${original}` : original);
+    }
+    if (pwsh.status === "not-found") {
+      assert.match(direct.stderr, /no usable PowerShell 7/);
+      assert.match(broker.stderr, /no usable PowerShell 7/);
+    }
+    assert.deepEqual(readAppServerArgs(binDir), [EXPECTED_APP_SERVER_ARGS, EXPECTED_APP_SERVER_ARGS]);
+  }
+);
