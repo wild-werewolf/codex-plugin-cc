@@ -99,14 +99,19 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
     const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
+    const storedJob = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+    // After `cancel`, late turn events must not move the job out of cancelled.
+    if (storedJob?.status === "cancelled") {
       return;
     }
 
-    const storedJob = readJobFile(jobFile);
+    upsertJob(workspaceRoot, patch);
+
+    if (!storedJob) {
+      return;
+    }
+
     writeJobFile(workspaceRoot, jobId, {
       ...storedJob,
       ...patch
@@ -139,6 +144,21 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function isCancelled(record) {
+  return record?.status === "cancelled";
+}
+
+/**
+ * Status of a finished run: an interrupted turn (`cancel` sends
+ * turn/interrupt) is cancelled, not failed.
+ */
+export function resolveCompletionStatus(execution) {
+  if (execution?.turnStatus === "interrupted") {
+    return "cancelled";
+  }
+  return execution?.exitStatus === 0 ? "completed" : "failed";
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const runningRecord = {
     ...job,
@@ -153,16 +173,29 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
+    // `cancel` may have recorded the job as cancelled while this run waited
+    // for its turn to end (e.g. the worker could not be killed): read the
+    // stored status again and never write over a cancellation.
+    const stored = readStoredJobOrNull(job.workspaceRoot, job.id);
+    const alreadyCancelled = isCancelled(stored);
+    const completionStatus = alreadyCancelled ? "cancelled" : resolveCompletionStatus(execution);
+    const completedAt = alreadyCancelled ? stored.completedAt ?? nowIso() : nowIso();
+    const phase = completionStatus === "completed" ? "done" : completionStatus;
+    const errorMessage = alreadyCancelled
+      ? stored.errorMessage ?? "Cancelled by user."
+      : completionStatus === "cancelled"
+        ? "The Codex turn was interrupted."
+        : undefined;
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
+      ...(alreadyCancelled ? stored : {}),
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase,
       completedAt,
+      ...(errorMessage ? { errorMessage } : {}),
       result: execution.payload,
       rendered: execution.rendered
     });
@@ -172,15 +205,22 @@ export async function runTrackedJob(job, runner, options = {}) {
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase,
       pid: null,
-      completedAt
+      completedAt,
+      ...(errorMessage ? { errorMessage } : {})
     });
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    if (isCancelled(existing)) {
+      // The run broke because it was cancelled (e.g. its connection went
+      // away); keep the cancellation and only note the error in the log.
+      appendLogLine(options.logFile ?? job.logFile ?? null, `Run ended after cancellation: ${errorMessage}`);
+      throw error;
+    }
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,

@@ -28,7 +28,15 @@ import {
   holdAwaitingApprovalPhase,
   listPendingApprovals,
   APPROVAL_MODES,
+  APPROVAL_TIMEOUT_CONFIG_KEY,
+  APPROVAL_TIMEOUT_ENV,
   DEFAULT_APPROVALS_CONFIG_KEY,
+  describeApprovalClosure,
+  formatApprovalResumeHint,
+  formatClosedApprovalMessage,
+  listApprovals,
+  normalizeApprovalTimeoutMinutes,
+  resolveApprovalTimeout,
   normalizeApprovalMode,
   describeDefaultApprovalMode,
   recordApprovalDecision,
@@ -99,7 +107,7 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-approvals <ask|auto-review|deny|unset>] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-approvals <ask|auto-review|deny|unset>] [--approval-timeout <minutes|unset>] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
@@ -217,6 +225,18 @@ function describeDefaultApprovals() {
   };
 }
 
+function describeApprovalTimeout() {
+  const { timeoutMs, source, file } = resolveApprovalTimeout();
+  return {
+    minutes: timeoutMs / 60000,
+    timeoutMs,
+    source,
+    ...(source === "env" ? { env: APPROVAL_TIMEOUT_ENV } : {}),
+    ...(file ? { file } : {}),
+    configFile: resolveUserConfigFile()
+  };
+}
+
 async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
@@ -264,6 +284,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     defaultApprovals: describeDefaultApprovals(),
+    approvalTimeout: describeApprovalTimeout(),
     ...(windowsSandbox ? { windowsSandbox } : {}),
     ...(windowsPowerShell ? { windowsPowerShell } : {}),
     protocol,
@@ -274,7 +295,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "default-approvals"],
+    valueOptions: ["cwd", "default-approvals", "approval-timeout"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
@@ -286,6 +307,12 @@ async function handleSetup(argv) {
   if (defaultApprovals !== undefined && defaultApprovals !== "unset" && !APPROVAL_MODES.includes(defaultApprovals)) {
     throw new Error(`Unsupported --default-approvals "${options["default-approvals"]}". Use one of: ${APPROVAL_MODES.join(", ")}, unset.`);
   }
+  const approvalTimeoutInput =
+    options["approval-timeout"] === undefined ? undefined : String(options["approval-timeout"]).trim().toLowerCase();
+  const approvalTimeoutMinutes =
+    approvalTimeoutInput === undefined || approvalTimeoutInput === "unset"
+      ? null
+      : normalizeApprovalTimeoutMinutes(approvalTimeoutInput);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -305,6 +332,17 @@ async function handleSetup(argv) {
   } else if (defaultApprovals !== undefined) {
     setUserConfigValue(DEFAULT_APPROVALS_CONFIG_KEY, defaultApprovals);
     actionsTaken.push(`Set the default approval mode for all repositories to ${defaultApprovals}.`);
+  }
+
+  if (approvalTimeoutInput === "unset") {
+    setUserConfigValue(APPROVAL_TIMEOUT_CONFIG_KEY, undefined);
+    actionsTaken.push("Removed the approval timeout setting; background jobs wait 15 minutes for an answer.");
+  } else if (approvalTimeoutMinutes !== null) {
+    setUserConfigValue(APPROVAL_TIMEOUT_CONFIG_KEY, approvalTimeoutMinutes);
+    actionsTaken.push(
+      `Set the approval timeout for all repositories to ${approvalTimeoutMinutes} minute${approvalTimeoutMinutes === 1 ? "" : "s"}.` +
+        (process.env[APPROVAL_TIMEOUT_ENV] ? ` ${APPROVAL_TIMEOUT_ENV} is set and still takes precedence.` : "")
+    );
   }
 
   const finalReport = await buildSetupReport(cwd, actionsTaken);
@@ -486,6 +524,7 @@ async function executeReviewRun(request) {
       exitStatus: result.status,
       threadId: result.threadId,
       turnId: result.turnId,
+      turnStatus: result.turn?.status ?? null,
       payload,
       rendered,
       summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
@@ -536,6 +575,7 @@ async function executeReviewRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    turnStatus: result.turn?.status ?? null,
     payload,
     rendered: `${renderReviewResult(parsed, {
       reviewLabel: reviewName,
@@ -625,6 +665,7 @@ async function executeTaskRun(request) {
     exitStatus: result.status,
     threadId: result.threadId,
     turnId: result.turnId,
+    turnStatus: result.turn?.status ?? null,
     payload,
     rendered,
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
@@ -994,15 +1035,32 @@ async function handleTaskWorker(argv) {
   );
 }
 
-function resolveActiveTaskJob(workspaceRoot, reference) {
+function resolveTaskJob(workspaceRoot, reference) {
   const job = listJobs(workspaceRoot).find((candidate) => candidate.id === reference);
   if (!job) {
     throw new Error(`No Codex job "${reference}".`);
   }
-  if (job.status !== "running" && job.status !== "queued") {
-    throw new Error(`Codex job ${reference} is ${job.status}; it has no open approvals.`);
-  }
   return job;
+}
+
+// Requests of a job that can no longer be answered, with how and when each
+// was closed.
+function listClosedApprovals(workspaceRoot, job) {
+  return listApprovals(workspaceRoot, job.id)
+    .map((entry) => describeApprovalClosure(entry, job))
+    .filter(Boolean);
+}
+
+function formatFinishedJobApprovalError(workspaceRoot, job, approvalId = null) {
+  const lines = [`Codex job ${job.id} is ${job.status}; it has no open approvals.`];
+  const entries = listApprovals(workspaceRoot, job.id);
+  const entry = approvalId ? entries.find((candidate) => candidate.approvalId === approvalId) : null;
+  if (entry) {
+    lines.push(formatClosedApprovalMessage(entry, job));
+  } else if (approvalId) {
+    lines.push(`It has no approval request ${approvalId}.`);
+  }
+  return lines.join("\n");
 }
 
 function handleApprovals(argv) {
@@ -1013,8 +1071,31 @@ function handleApprovals(argv) {
 
   const workspaceRoot = resolveCommandWorkspace(options);
   const reference = positionals[0] ?? "";
+  if (reference) {
+    const job = resolveTaskJob(workspaceRoot, reference);
+    if (!isActiveJobStatus(job.status)) {
+      // A finished job: nothing to answer, but say what happened to its
+      // requests and how to retry, rather than only "no open approvals".
+      const closed = listClosedApprovals(workspaceRoot, job);
+      const resumable = closed.filter((entry) => entry.resumable);
+      const resumeHint = resumable.length ? formatApprovalResumeHint(resumable.at(-1).summary) : null;
+      const lines = [`Codex job ${job.id} is ${job.status}; no approval requests are waiting.`];
+      for (const entry of closed) {
+        lines.push(`- ${entry.approvalId}${entry.summary ? ` (${entry.summary})` : ""}: ${entry.detail}.`);
+      }
+      if (resumeHint) {
+        lines.push(resumeHint);
+      }
+      outputCommandResult(
+        { pending: [], job: { id: job.id, status: job.status }, closed, resumeHint },
+        `${lines.join("\n")}\n`,
+        options.json
+      );
+      return;
+    }
+  }
   const jobs = reference
-    ? [resolveActiveTaskJob(workspaceRoot, reference)]
+    ? [resolveTaskJob(workspaceRoot, reference)]
     : filterJobsForCurrentClaudeSession(listJobs(workspaceRoot)).filter((job) => isActiveJobStatus(job.status));
   const pending = jobs.flatMap((job) => listPendingApprovals(workspaceRoot, job.id));
   outputCommandResult({ pending }, renderApprovalList(pending), options.json);
@@ -1031,7 +1112,10 @@ function handleApprove(argv) {
     throw new Error("Usage: approve <job-id> <approval-id> --decision <accept|decline>");
   }
   const workspaceRoot = resolveCommandWorkspace(options);
-  const job = resolveActiveTaskJob(workspaceRoot, jobId);
+  const job = resolveTaskJob(workspaceRoot, jobId);
+  if (!isActiveJobStatus(job.status)) {
+    throw new Error(formatFinishedJobApprovalError(workspaceRoot, job, approvalId));
+  }
   // Inside a known Claude session, only that session's own jobs can be decided.
   const sessionId = getCurrentClaudeSessionId();
   if (sessionId && job.sessionId !== sessionId) {
@@ -1217,7 +1301,15 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  // A worker that cannot be killed still ends once its turn is interrupted;
+  // it keeps the cancelled status recorded below (see runTrackedJob).
+  let termination;
+  try {
+    termination = terminateProcessTree(job.pid ?? Number.NaN);
+  } catch (error) {
+    termination = { attempted: true, delivered: false, error: error instanceof Error ? error.message : String(error) };
+    appendLogLine(job.logFile, `Could not stop the worker process ${job.pid}: ${termination.error}`);
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1249,10 +1341,16 @@ async function handleCancel(argv) {
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    workerTerminated: Boolean(termination.delivered),
+    ...(termination.error ? { workerTerminationError: termination.error } : {})
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  outputCommandResult(
+    payload,
+    renderCancelReport({ ...nextJob, workerTerminationError: termination.error ?? null }),
+    options.json
+  );
 }
 
 async function main() {

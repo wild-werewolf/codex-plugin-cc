@@ -14,7 +14,7 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 import { failClosedServerRequestResult } from "./approvals.mjs";
 import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
+import { ensureBrokerSession, forgetDeadBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 import { formatPwshNotFoundWarning, prependPathDirectory, resolveCompatiblePwsh } from "./windows-powershell.mjs";
 
@@ -491,34 +491,75 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
   }
 }
 
+// A broker that went away (idle timeout, crash) between the broker.json lookup
+// and the connection: no socket (ENOENT, ECONNREFUSED) or a socket closed
+// before `initialize` was answered.
+const BROKER_GONE_ERROR_CODES = new Set(["ENOENT", "ECONNREFUSED", "ECONNRESET", "EPIPE"]);
+
+function isBrokerGone(error, client) {
+  return BROKER_GONE_ERROR_CODES.has(error?.code) || (Boolean(client?.exitResolved) && error?.rpcCode === undefined);
+}
+
 export class CodexAppServerClient {
   static async connect(cwd, options = {}) {
-    let brokerEndpoint = null;
-    if (!options.disableBroker) {
-      brokerEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
-      if (!brokerEndpoint && options.reuseExistingBroker) {
-        brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
-      }
-      if (!brokerEndpoint && !options.reuseExistingBroker) {
-        // Reject an unsupported CODEX_COMPANION_WINDOWS_SANDBOX here rather
-        // than after the broker failed to start its app-server.
-        buildAppServerSpawnArgs({ env: options.env ?? process.env });
-        const brokerSession = await ensureBrokerSession(cwd, {
-          env: options.env,
-          // Only when a new broker is started: an unusable CODEX_COMPANION_PWSH
-          // or a missing PowerShell 7 is reported here, where the user sees it,
-          // not only in the broker log. The broker's own app-server gets the
-          // same PATH from buildAppServerSpawnEnv; the broker's env is unchanged.
-          beforeSpawn: () => {
-            buildAppServerSpawnEnv({ env: options.env ?? process.env });
-          }
-        });
-        brokerEndpoint = brokerSession?.endpoint ?? null;
+    if (options.disableBroker) {
+      return CodexAppServerClient.connectDirect(cwd, options);
+    }
+
+    const ensureBroker = async () => {
+      // Reject an unsupported CODEX_COMPANION_WINDOWS_SANDBOX here rather
+      // than after the broker failed to start its app-server.
+      buildAppServerSpawnArgs({ env: options.env ?? process.env });
+      const brokerSession = await ensureBrokerSession(cwd, {
+        env: options.env,
+        // Only when a new broker is started: an unusable CODEX_COMPANION_PWSH
+        // or a missing PowerShell 7 is reported here, where the user sees it,
+        // not only in the broker log. The broker's own app-server gets the
+        // same PATH from buildAppServerSpawnEnv; the broker's env is unchanged.
+        beforeSpawn: () => {
+          buildAppServerSpawnEnv({ env: options.env ?? process.env });
+        }
+      });
+      return brokerSession?.endpoint ?? null;
+    };
+
+    const explicitEndpoint = options.brokerEndpoint ?? options.env?.[BROKER_ENDPOINT_ENV] ?? process.env[BROKER_ENDPOINT_ENV] ?? null;
+    if (explicitEndpoint) {
+      // An endpoint given by the caller is used as is; callers such as
+      // withAppServer decide what to do when it is unreachable.
+      return CodexAppServerClient.connectBroker(cwd, explicitEndpoint, options);
+    }
+
+    let brokerEndpoint = options.reuseExistingBroker ? loadBrokerSession(cwd)?.endpoint ?? null : await ensureBroker();
+    for (let attempt = 0; brokerEndpoint && attempt < 2; attempt += 1) {
+      let client = null;
+      try {
+        client = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+        await client.initialize();
+        return client;
+      } catch (error) {
+        await client?.close().catch(() => {});
+        if (!isBrokerGone(error, client)) {
+          throw error;
+        }
+        // The broker recorded in broker.json is gone (e.g. it exited after
+        // its idle timeout). Forget it; start a new one unless the caller
+        // only wanted to reuse an existing broker.
+        forgetDeadBrokerSession(cwd, brokerEndpoint);
+        brokerEndpoint = options.reuseExistingBroker || attempt > 0 ? null : await ensureBroker();
       }
     }
-    const client = brokerEndpoint
-      ? new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint })
-      : new SpawnedCodexAppServerClient(cwd, options);
+    return CodexAppServerClient.connectDirect(cwd, options);
+  }
+
+  static async connectBroker(cwd, brokerEndpoint, options = {}) {
+    const client = new BrokerCodexAppServerClient(cwd, { ...options, brokerEndpoint });
+    await client.initialize();
+    return client;
+  }
+
+  static async connectDirect(cwd, options = {}) {
+    const client = new SpawnedCodexAppServerClient(cwd, options);
     await client.initialize();
     return client;
   }

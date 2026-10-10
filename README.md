@@ -198,7 +198,9 @@ Ask Codex to redesign the database connection to be more resilient.
 
 ### `/codex:approve`
 
-Shows approval requests from a running background Codex job one at a time, records your answer, and keeps following the job until it finishes. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes (`CODEX_COMPANION_APPROVAL_TIMEOUT_MS`). The first answer is final, and inside a Claude session only jobs started from that session can be answered.
+Shows approval requests from a running background Codex job one at a time, records your answer, and keeps following the job until it finishes. Each request is approved once at most, never for the whole session. A request that gets no answer is declined after 15 minutes; change that with `/codex:setup --approval-timeout <minutes>` (see below) or, with priority over the setting, `CODEX_COMPANION_APPROVAL_TIMEOUT_MS`. The first answer is final, and inside a Claude session only jobs started from that session can be answered.
+
+If you answer too late, `approve` says when and how the request was closed (`timeout`, `user`, `resolved-by-server`, or the connection to Codex closing) and how to pick the work up again: Codex was told "declined", so continue the same Codex thread with, for example, `/codex:rescue --background --resume Retry: <what Codex asked to do>`. `/codex:approve <job-id>` on a finished job shows the same for each of its requests.
 
 ```bash
 /codex:approve
@@ -253,7 +255,7 @@ Examples:
 
 ### `/codex:cancel`
 
-Cancels an active background Codex job.
+Cancels an active background Codex job: it interrupts the Codex turn, stops the worker process with its process tree (`taskkill /T /F` on Windows, started without a shell so Git Bash cannot rewrite its arguments), and records the job as `cancelled`. If the worker cannot be stopped, it ends once Codex finishes the interrupted turn, and the job stays `cancelled`.
 
 Examples:
 
@@ -303,7 +305,7 @@ If none qualifies, the plugin keeps Codex's own choice, which may be Windows Pow
 setx CODEX_COMPANION_PWSH "C:\path\to\PowerShell\7\pwsh.exe"
 ```
 
-then restart Claude Code. A `CODEX_COMPANION_PWSH` that does not point to a usable PowerShell 7 is an error, with no fallback. The variable is ignored on macOS and Linux. A shared runtime that is already running keeps the PowerShell it was started with until the Claude session ends.
+then restart Claude Code. A `CODEX_COMPANION_PWSH` that does not point to a usable PowerShell 7 is an error, with no fallback. The variable is ignored on macOS and Linux. A shared runtime that is already running keeps the PowerShell it was started with until it stops (see [Shared runtime lifetime](#shared-runtime-lifetime)).
 
 #### Default approval mode
 
@@ -321,6 +323,21 @@ The setting is stored once per user, outside the plugin's data directory, so it 
 - anywhere else: set `CODEX_COMPANION_CONFIG_FILE` to the full path of the file
 
 `/codex:setup` shows the mode, where it comes from, and the actual file. Releases up to `1.0.6-approvals.2` kept it in `${CLAUDE_PLUGIN_DATA}/config.json`, a directory named after the plugin and its marketplace (for example `~/.claude/plugins/data/codex-openai-codex`). While the new file does not exist yet, that old file is still read (and if this installation has none, the newest `config.json` of another installation next to it that holds a plugin setting, for example `codex-openai-codex` when you now use `codex-wild-codex`), and `/codex:setup` says which file it came from; the next `/codex:setup --default-approvals ...` writes the new file, carrying over only the plugin's own settings (`defaultApprovals`) and leaving the old file in place. To move the setting to another machine, copy the file. To reset it, run `/codex:setup --default-approvals unset` or delete the file. Job state (`state.json`, jobs) stays in `CLAUDE_PLUGIN_DATA`.
+
+#### Approval timeout
+
+```bash
+/codex:setup --approval-timeout 40
+/codex:setup --approval-timeout unset
+```
+
+Sets how many minutes (1 to 1440) a background job waits for your answer to an approval request before it declines it; the default is 15. It is stored in the same per-user `config.json` as the default approval mode (`approvalTimeoutMinutes`). `CODEX_COMPANION_APPROVAL_TIMEOUT_MS`, when set, still takes precedence. A running job keeps the timeout it started with. `/codex:setup` shows the value and where it comes from.
+
+#### Shared runtime lifetime
+
+The first review or task in a Claude session starts a shared broker that keeps one `codex app-server` (with its MCP servers, for example `node_repl.exe` on Windows) for the commands that follow. The broker stops on its own after 5 minutes without work: no request in progress, no Codex turn running, and no approval request waiting for your answer (a pending approval counts as work, however long you take). It then closes its app-server, removes its socket or pipe, pid file and log, and removes this session's `broker.json` if it still points to it; the next command starts a new broker. It also stops when its app-server exits, and at `SessionEnd` as before, so a Claude session that ends without `SessionEnd` (a crash) no longer leaves it running until reboot.
+
+Set `CODEX_COMPANION_BROKER_IDLE_MS` in the environment Claude Code starts in to change the idle time in milliseconds; `0` keeps the broker until `SessionEnd`, as in earlier releases. Anything that is not a non-negative integer is ignored (with a line in the broker log) and the 5-minute default applies.
 
 #### Enabling review gate
 

@@ -1802,6 +1802,87 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+function processAlive(pid) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+test("a cancelled job stays cancelled when its worker outlives cancel and finishes the interrupted turn", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task-late-interrupt");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId && job.pid ? job : null;
+  }, { timeoutMs: 15000 });
+  const workerPid = runningJob.pid;
+
+  // Simulate a cancel that cannot kill the worker (taskkill under Git Bash
+  // before this fix): hide the worker pid from cancel.
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs = state.jobs.map((job) => (job.id === jobId ? { ...job, pid: null } : job));
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  const cancelPayload = JSON.parse(cancelResult.stdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.turnInterrupted, true);
+  assert.equal(cancelPayload.workerTerminated, false);
+  assert.ok(processAlive(workerPid), "the worker should still be running after cancel");
+
+  // The worker receives the interrupted turn/completed after cancel wrote
+  // its record, writes its final record and exits.
+  await waitFor(() => !processAlive(workerPid), { timeoutMs: 15000 });
+
+  const finalState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  const finalJob = finalState.jobs.find((job) => job.id === jobId);
+  assert.equal(finalJob.status, "cancelled");
+  assert.equal(finalJob.phase, "cancelled");
+  assert.equal(finalJob.pid, null);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.errorMessage, "Cancelled by user.");
+  assert.ok(stored.cancelledAt);
+});
+
+test("an interrupted turn is recorded as cancelled, not failed", async () => {
+  const { resolveCompletionStatus } = await import("../plugins/codex/scripts/lib/tracked-jobs.mjs");
+  assert.equal(resolveCompletionStatus({ exitStatus: 1, turnStatus: "interrupted" }), "cancelled");
+  assert.equal(resolveCompletionStatus({ exitStatus: 1, turnStatus: "failed" }), "failed");
+  assert.equal(resolveCompletionStatus({ exitStatus: 0, turnStatus: "completed" }), "completed");
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
