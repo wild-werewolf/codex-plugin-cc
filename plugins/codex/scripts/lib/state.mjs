@@ -189,17 +189,47 @@ export function setConfig(cwd, key, value) {
 }
 
 // Per-user settings shared by every repository, e.g. the default approval
-// mode. Lives next to the per-repository state roots, not inside one.
+// mode. They live in a fixed per-user location: CLAUDE_PLUGIN_DATA is named
+// after the plugin *and* its marketplace, so it changes when the plugin is
+// installed from another marketplace and can be removed with the plugin.
+export const USER_CONFIG_FILE_ENV = "CODEX_COMPANION_CONFIG_FILE";
+const USER_CONFIG_DIR_NAME = "codex-companion";
 const USER_CONFIG_FILE_NAME = "config.json";
 
-export function resolveUserConfigFile() {
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  return path.join(pluginDataDir || FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME);
+/**
+ * Where per-user settings are written:
+ * `CODEX_COMPANION_CONFIG_FILE`, else `%APPDATA%\codex-companion\config.json`
+ * on Windows, else `${XDG_CONFIG_HOME:-~/.config}/codex-companion/config.json`.
+ */
+export function resolveUserConfigFile(options = {}) {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const homedir = options.homedir ?? os.homedir();
+  if (env[USER_CONFIG_FILE_ENV]) {
+    return platform === "win32" ? path.win32.resolve(env[USER_CONFIG_FILE_ENV]) : path.resolve(env[USER_CONFIG_FILE_ENV]);
+  }
+  if (platform === "win32") {
+    const appData = env.APPDATA || path.win32.join(homedir, "AppData", "Roaming");
+    return path.win32.join(appData, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME);
+  }
+  // XDG: a relative XDG_CONFIG_HOME is invalid and must be ignored.
+  const configHome = env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(homedir, ".config");
+  return path.join(configHome, USER_CONFIG_DIR_NAME, USER_CONFIG_FILE_NAME);
+}
+
+/** Where releases up to 1.0.6-approvals.2 kept the per-user settings. */
+export function resolveLegacyUserConfigFiles(env = process.env) {
+  const files = [];
+  if (env[PLUGIN_DATA_ENV]) {
+    files.push(path.join(env[PLUGIN_DATA_ENV], USER_CONFIG_FILE_NAME));
+  }
+  files.push(path.join(FALLBACK_STATE_ROOT_DIR, USER_CONFIG_FILE_NAME));
+  return files;
 }
 
 function ownedByAnotherUser(filePath) {
-  // The fallback root is in the shared temp dir; ignore a file planted there
-  // by another local account.
+  // The legacy fallback root is in the shared temp dir; ignore a file planted
+  // there by another local account.
   if (typeof process.getuid !== "function") {
     return false;
   }
@@ -210,10 +240,9 @@ function ownedByAnotherUser(filePath) {
   }
 }
 
-export function loadUserConfig() {
-  const filePath = resolveUserConfigFile();
+function readConfigObject(filePath) {
   if (!fs.existsSync(filePath) || ownedByAnotherUser(filePath)) {
-    return {};
+    return null;
   }
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -223,10 +252,37 @@ export function loadUserConfig() {
   }
 }
 
-/** Set (or, with `undefined`, remove) one per-user setting; written atomically. */
+/**
+ * Read the per-user settings. The current file wins as soon as it exists;
+ * until then the first legacy file found is used (`legacy: true`).
+ */
+export function readUserConfig() {
+  const file = resolveUserConfigFile();
+  const current = readConfigObject(file);
+  if (current) {
+    return { values: current, file, legacy: false };
+  }
+  for (const legacyFile of resolveLegacyUserConfigFiles()) {
+    const legacy = readConfigObject(legacyFile);
+    if (legacy) {
+      return { values: legacy, file: legacyFile, legacy: true };
+    }
+  }
+  return { values: {}, file, legacy: false };
+}
+
+export function loadUserConfig() {
+  return readUserConfig().values;
+}
+
+/**
+ * Set (or, with `undefined`, remove) one per-user setting, written atomically
+ * to the current file. Values still only in a legacy file are carried over on
+ * this first write; the legacy file itself is left in place.
+ */
 export function setUserConfigValue(key, value) {
   const filePath = resolveUserConfigFile();
-  const next = { ...loadUserConfig() };
+  const next = { ...readUserConfig().values };
   if (value === undefined) {
     delete next[key];
   } else {

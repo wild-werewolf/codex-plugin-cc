@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { resolveLegacyUserConfigFiles, resolveUserConfigFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -123,14 +124,14 @@ test("setup --default-approvals sets a per-user default that --approvals overrid
   const set = run("node", [SCRIPT, "setup", "--default-approvals", "auto-review", "--json"], { cwd: repo, env });
   assert.equal(set.status, 0, set.stderr);
   const report = JSON.parse(set.stdout);
-  const configFile = path.join(env.CLAUDE_PLUGIN_DATA, "config.json");
-  assert.deepEqual(report.defaultApprovals, { mode: "auto-review", source: "plugin-default", file: configFile });
+  const configFile = env.CODEX_COMPANION_CONFIG_FILE;
+  assert.deepEqual(report.defaultApprovals, { mode: "auto-review", source: "plugin-default", file: configFile, configFile });
   assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review" });
   assert.match(run("node", [SCRIPT, "setup"], { cwd: repo, env }).stdout, /- default approvals: auto-review \(plugin default from .+config\.json\)/);
 
   // Another repository picks up the same default: it is per user, not per repo.
   const other = setupRepo();
-  const otherEnv = { ...other.env, CLAUDE_PLUGIN_DATA: env.CLAUDE_PLUGIN_DATA };
+  const otherEnv = { ...other.env, CODEX_COMPANION_CONFIG_FILE: env.CODEX_COMPANION_CONFIG_FILE };
   assert.equal(run("node", [SCRIPT, "task", "look around"], { cwd: other.repo, env: otherEnv }).status, 0);
   assert.equal(readFakeState(other.statePath).lastThreadStart.approvalsReviewer, "auto_review");
 
@@ -164,7 +165,7 @@ test("setup --default-approvals sets a per-user default that --approvals overrid
   state = readFakeState(statePath);
   assert.equal("approvalsReviewer" in state.lastThreadStart, false);
   assert.equal(state.lastTurnStart.approvalsReviewer, null);
-  assert.match(run("node", [SCRIPT, "setup"], { cwd: repo, env }).stdout, /- default approvals: not set \(the approvals_reviewer from your Codex config applies\)/);
+  assert.match(run("node", [SCRIPT, "setup"], { cwd: repo, env }).stdout, /- default approvals: not set \(the approvals_reviewer from your Codex config applies; setting file: .+codex-companion-config\.json\)/);
 
   const invalid = run("node", [SCRIPT, "setup", "--default-approvals", "always"], { cwd: repo, env });
   assert.notEqual(invalid.status, 0);
@@ -218,4 +219,102 @@ test("a real DEP0190 from spawn with shell: true is filtered (Node 24+)", { skip
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /DEP0190/);
   assert.match(result.stderr, /DEP0999/);
+});
+
+// --- where the per-user setting lives ------------------------------------------
+
+test("the per-user setting has a fixed default path on Windows and elsewhere", () => {
+  assert.equal(
+    resolveUserConfigFile({ env: { APPDATA: "C:\\Users\\me\\AppData\\Roaming" }, platform: "win32", homedir: "C:\\Users\\me" }),
+    "C:\\Users\\me\\AppData\\Roaming\\codex-companion\\config.json"
+  );
+  assert.equal(
+    resolveUserConfigFile({ env: {}, platform: "win32", homedir: "C:\\Users\\me" }),
+    "C:\\Users\\me\\AppData\\Roaming\\codex-companion\\config.json"
+  );
+  assert.equal(resolveUserConfigFile({ env: {}, platform: "linux", homedir: "/home/me" }), "/home/me/.config/codex-companion/config.json");
+  assert.equal(
+    resolveUserConfigFile({ env: { XDG_CONFIG_HOME: "/xdg" }, platform: "darwin", homedir: "/Users/me" }),
+    "/xdg/codex-companion/config.json"
+  );
+  assert.equal(
+    resolveUserConfigFile({ env: { XDG_CONFIG_HOME: "relative/dir" }, platform: "linux", homedir: "/home/me" }),
+    "/home/me/.config/codex-companion/config.json",
+    "a relative XDG_CONFIG_HOME is ignored"
+  );
+  // CLAUDE_PLUGIN_DATA no longer decides where the setting lives.
+  assert.equal(
+    resolveUserConfigFile({ env: { CLAUDE_PLUGIN_DATA: "/data/codex-wild-codex" }, platform: "linux", homedir: "/home/me" }),
+    "/home/me/.config/codex-companion/config.json"
+  );
+  assert.equal(
+    resolveUserConfigFile({ env: { CODEX_COMPANION_CONFIG_FILE: "/custom/settings.json", XDG_CONFIG_HOME: "/xdg" }, platform: "linux" }),
+    "/custom/settings.json"
+  );
+  assert.equal(
+    resolveUserConfigFile({ env: { CODEX_COMPANION_CONFIG_FILE: "D:\\cfg\\codex.json", APPDATA: "C:\\x" }, platform: "win32" }),
+    "D:\\cfg\\codex.json"
+  );
+});
+
+function setupWithoutOverride() {
+  const fixture = setupRepo();
+  const env = { ...fixture.env, XDG_CONFIG_HOME: makeTempDir(), APPDATA: makeTempDir() };
+  delete env.CODEX_COMPANION_CONFIG_FILE;
+  const configFile =
+    process.platform === "win32"
+      ? path.join(env.APPDATA, "codex-companion", "config.json")
+      : path.join(env.XDG_CONFIG_HOME, "codex-companion", "config.json");
+  return { ...fixture, env, configFile };
+}
+
+test("the default survives a change of CLAUDE_PLUGIN_DATA (another marketplace)", () => {
+  const { repo, env, configFile, statePath } = setupWithoutOverride();
+  const openaiEnv = { ...env, CLAUDE_PLUGIN_DATA: path.join(makeTempDir(), "codex-openai-codex") };
+  const set = run("node", [SCRIPT, "setup", "--default-approvals", "auto-review", "--json"], { cwd: repo, env: openaiEnv });
+  assert.equal(set.status, 0, set.stderr);
+  assert.equal(JSON.parse(set.stdout).defaultApprovals.file, configFile);
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review" });
+  assert.equal(fs.existsSync(path.join(openaiEnv.CLAUDE_PLUGIN_DATA, "config.json")), false);
+
+  const wildEnv = { ...env, CLAUDE_PLUGIN_DATA: path.join(makeTempDir(), "codex-wild-codex") };
+  const report = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
+  assert.deepEqual(report.defaultApprovals, { mode: "auto-review", source: "plugin-default", file: configFile, configFile });
+  assert.equal(run("node", [SCRIPT, "task", "look around"], { cwd: repo, env: wildEnv }).status, 0);
+  assert.equal(readFakeState(statePath).lastThreadStart.approvalsReviewer, "auto_review");
+
+  const unset = run("node", [SCRIPT, "setup", "--default-approvals", "unset", "--json"], { cwd: repo, env: wildEnv });
+  assert.equal(JSON.parse(unset.stdout).defaultApprovals.mode, null);
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), {});
+});
+
+test("a default from the old CLAUDE_PLUGIN_DATA config.json is read and moved on the next write", () => {
+  const { repo, env, configFile, statePath } = setupWithoutOverride();
+  const legacyEnv = { ...env, CLAUDE_PLUGIN_DATA: path.join(makeTempDir(), "codex-openai-codex") };
+  const legacyFile = path.join(legacyEnv.CLAUDE_PLUGIN_DATA, "config.json");
+  assert.equal(resolveLegacyUserConfigFiles(legacyEnv)[0], legacyFile);
+  fs.mkdirSync(path.dirname(legacyFile), { recursive: true });
+  fs.writeFileSync(legacyFile, JSON.stringify({ defaultApprovals: "deny", somethingElse: 1 }));
+
+  const report = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout);
+  assert.deepEqual(report.defaultApprovals, { mode: "deny", source: "plugin-default-legacy", file: legacyFile, configFile });
+  assert.match(
+    run("node", [SCRIPT, "setup"], { cwd: repo, env: legacyEnv }).stdout,
+    /- default approvals: deny \(plugin default read from the old location .+config\.json; the next `--default-approvals` change saves it to .+codex-companion.config\.json\)/
+  );
+  assert.equal(run("node", [SCRIPT, "task", "look around"], { cwd: repo, env: legacyEnv }).status, 0);
+  assert.equal(readFakeState(statePath).lastThreadStart.approvalsReviewer, "user", "deny routes to the user reviewer");
+  assert.equal(fs.existsSync(configFile), false, "reading does not write");
+
+  // First write migrates every legacy value into the new file and keeps the old file.
+  run("node", [SCRIPT, "setup", "--default-approvals", "auto-review"], { cwd: repo, env: legacyEnv });
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review", somethingElse: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(legacyFile, "utf8")), { defaultApprovals: "deny", somethingElse: 1 });
+  const after = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout);
+  assert.deepEqual(after.defaultApprovals, { mode: "auto-review", source: "plugin-default", file: configFile, configFile });
+
+  // Once the new file exists it wins, even after unset.
+  run("node", [SCRIPT, "setup", "--default-approvals", "unset"], { cwd: repo, env: legacyEnv });
+  assert.equal(JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout).defaultApprovals.mode, null);
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { somethingElse: 1 });
 });

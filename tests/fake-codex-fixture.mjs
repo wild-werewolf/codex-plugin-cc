@@ -798,6 +798,8 @@ export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
   return {
     ...process.env,
-    PATH: `${binDir}${sep}${process.env.PATH}`
+    PATH: `${binDir}${sep}${process.env.PATH}`,
+    // Keep tests away from the real per-user settings file.
+    CODEX_COMPANION_CONFIG_FILE: path.join(binDir, "codex-companion-config.json")
   };
 }
