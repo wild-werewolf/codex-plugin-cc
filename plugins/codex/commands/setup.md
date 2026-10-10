@@ -1,6 +1,6 @@
 ---
-description: Check whether the local Codex CLI is ready and optionally toggle the stop-time review gate
-argument-hint: '[--enable-review-gate|--disable-review-gate]'
+description: Check whether the local Codex CLI is ready, optionally toggle the stop-time review gate, and set the default approval mode
+argument-hint: '[--enable-review-gate|--disable-review-gate] [--default-approvals ask|auto-review|deny|unset]'
 allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
 ---
 
@@ -35,3 +35,4 @@ Output rules:
 - Present the final setup output to the user.
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
+- Show the `defaultApprovals` value and where it comes from: a plugin default (`mode` and `file`) or not set, in which case the `approvals_reviewer` from the user's Codex config applies.

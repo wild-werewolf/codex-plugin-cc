@@ -25,7 +25,9 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
+- If the forwarded request includes `--background`, pass `--background` to `task`: the companion starts a detached job (the only kind that can wait for approval answers) and returns its id within seconds. Return that launch line unchanged; following the job is the main Claude thread's work (`codex:codex-approvals` skill), not yours.
+- If the forwarded request includes `--wait`, strip it before calling `task`.
+- Do not treat `--background` or `--wait` as part of the natural-language task text.
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--approvals <ask|auto-review|deny>`, pass it through to `task` unchanged. Never add it on your own.

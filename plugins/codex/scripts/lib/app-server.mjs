@@ -173,22 +173,24 @@ class AppServerClientBase {
     // Without a handler, approval requests are declined (fail-closed) rather
     // than answered "unsupported", which Codex treats as a broken turn.
     const handler = this.serverRequestHandler ?? failClosedServerRequestResult;
+    const reply = (payload) => {
+      // After the connection ended (e.g. onClosed declined a waiting request
+      // because `codex app-server` died) there is nobody to answer, and a
+      // write to the dead stdin would fail with EPIPE.
+      if (this.closed || this.exitResolved) {
+        return;
+      }
+      try {
+        this.sendMessage({ id: message.id, ...payload });
+      } catch {
+        // The transport went away between the check and the write.
+      }
+    };
     Promise.resolve()
       .then(() => handler(message))
       .then(
-        (result) => {
-          if (!this.closed) {
-            this.sendMessage({ id: message.id, result: result ?? {} });
-          }
-        },
-        (error) => {
-          if (!this.closed) {
-            this.sendMessage({
-              id: message.id,
-              error: buildJsonRpcError(error?.rpcCode ?? -32000, error?.message ?? String(error))
-            });
-          }
-        }
+        (result) => reply({ result: result ?? {} }),
+        (error) => reply({ error: buildJsonRpcError(error?.rpcCode ?? -32000, error?.message ?? String(error)) })
       );
   }
 
@@ -231,6 +233,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
 
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
+    // A write racing the child's exit fails asynchronously (EPIPE); the exit
+    // itself is reported through "exit", so do not let it crash the process.
+    this.proc.stdin.on("error", () => {});
 
     this.proc.stderr.on("data", (chunk) => {
       this.stderr += chunk;

@@ -1,7 +1,7 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
 argument-hint: "[--background|--wait] [--resume|--fresh] [--approvals <ask|auto-review|deny>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
-allowed-tools: Bash(node:*), AskUserQuestion, Agent
+allowed-tools: Bash(node:*), AskUserQuestion, Agent, Skill
 ---
 
 Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
@@ -13,13 +13,13 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
-- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
+- If the request includes `--background`, Codex runs as a detached background job of the companion, because only such a job can wait for approval answers. Keep `--background` in the forwarded request so the subagent passes it to `task`, and run the `codex:codex-rescue` subagent in the foreground (do not set `run_in_background` on the `Agent` call): it returns within seconds with the job id.
+- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground. `--wait` is not forwarded to `task`.
 - If neither flag is present, default to foreground.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
+- Do not treat `--background` or `--wait` as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - `--approvals <ask|auto-review|deny>` is a runtime flag too. Preserve it for the forwarded `task` call. Never add it yourself.
-- Codex may ask to leave its sandbox. Only background runs can wait for the user: when `/codex:status` shows `awaiting-approval`, tell the user to run `/codex:approve <job-id>`. Foreground runs decline such requests and list them under "Approval requests" in the output.
+- Codex may ask to leave its sandbox. Only background jobs can wait for the user; foreground runs decline such requests and list them under "Approval requests" in the output.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Codex, check for a resumable rescue thread from this Claude session by running:
@@ -43,6 +43,7 @@ Operating rules:
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
+- If that stdout is a background launch line (`... started in the background as <job-id>. ...`), follow the job right away with the `codex:codex-approvals` skill (load it with the `Skill` tool): start `watch <job-id> --json` with `Bash` and `run_in_background: true`, ask the user about each approval request it reports, and show `result <job-id>` verbatim when the job is done. This follow-up is yours, not the subagent's.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.

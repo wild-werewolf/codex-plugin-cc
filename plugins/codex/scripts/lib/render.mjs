@@ -190,6 +190,13 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
+    ...(report.defaultApprovals
+      ? [
+          report.defaultApprovals.mode
+            ? `- default approvals: ${report.defaultApprovals.mode} (plugin default from ${report.defaultApprovals.file})`
+            : "- default approvals: not set (the approvals_reviewer from your Codex config applies)"
+        ]
+      : []),
     ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
     ""
   ];

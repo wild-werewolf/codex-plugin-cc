@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 1.0.6-approvals.2
+
+- New `watch <job-id> [--json]` subcommand: waits until a background job has a pending approval request, finishes, or the timeout passes, and prints one event.
+- `/codex:rescue --background` passes `--background` to `task` (the companion's detached job is the only kind that can wait for approvals) and the main Claude thread follows the job with `watch`, asking about each approval request and showing the result when it is done. `/codex:approve` keeps following the job too. The rules live in the new `codex-approvals` skill.
+- `/codex:setup --default-approvals <ask|auto-review|deny|unset>` stores a per-user default approval mode in `${CLAUDE_PLUGIN_DATA}/config.json`. Precedence: `--approvals`, then the default, then the Codex config. Applies to `task`, `review`, and `adversarial-review`; the applied reviewer is verified the same way.
+- A server request answered after `codex app-server` exited is no longer written to its dead stdin (EPIPE could crash the worker).
+- Entry points filter Node's DEP0190 warning ("Passing args to a child process with shell option true") and keep every other warning.
+
+## 1.0.6-approvals.1
 
 - Stop forcing `approvalPolicy: "never"` on `thread/start` and `thread/resume`; the Codex config decides when to ask. `--write` still selects `workspace-write`, otherwise `read-only`.
 - Handle app-server approval requests (`item/commandExecution|fileChange|permissions/requestApproval` and the legacy `execCommandApproval`/`applyPatchApproval`) instead of rejecting them as unsupported. Background tasks wait for `/codex:approve`; foreground runs and reviews decline. Unanswered requests are declined after a timeout.
