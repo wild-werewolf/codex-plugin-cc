@@ -193,6 +193,10 @@ export function setConfig(cwd, key, value) {
 // after the plugin *and* its marketplace, so it changes when the plugin is
 // installed from another marketplace and can be removed with the plugin.
 export const USER_CONFIG_FILE_ENV = "CODEX_COMPANION_CONFIG_FILE";
+// Settings this plugin keeps in the per-user file. Only these are taken from
+// old or sibling `config.json` files: a `codex-*` data directory may belong
+// to another plugin, whose keys must never be read or copied.
+export const USER_CONFIG_KEYS = Object.freeze(["defaultApprovals"]);
 const USER_CONFIG_DIR_NAME = "codex-companion";
 const USER_CONFIG_FILE_NAME = "config.json";
 
@@ -286,9 +290,14 @@ function readConfigObject(filePath) {
   }
 }
 
+function pickKnownUserConfigKeys(values) {
+  return Object.fromEntries(USER_CONFIG_KEYS.filter((key) => key in values).map((key) => [key, values[key]]));
+}
+
 /**
  * Read the per-user settings. The current file wins as soon as it exists;
- * until then the first legacy file found is used (`legacy: true`).
+ * until then the first legacy file found is used (`legacy: true`), reduced to
+ * the known keys.
  */
 export function readUserConfig() {
   const file = resolveUserConfigFile();
@@ -298,11 +307,15 @@ export function readUserConfig() {
   }
   const ownLegacyFile = process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], USER_CONFIG_FILE_NAME) : null;
   for (const legacyFile of resolveLegacyUserConfigFiles()) {
-    const legacy = readConfigObject(legacyFile);
-    // This installation's own old file counts even when empty (an explicit
-    // unset); an empty file elsewhere must not hide an older one with values.
-    if (legacy && (legacyFile === ownLegacyFile || Object.keys(legacy).length > 0)) {
-      return { values: legacy, file: legacyFile, legacy: true };
+    const raw = readConfigObject(legacyFile);
+    if (!raw) {
+      continue;
+    }
+    const known = pickKnownUserConfigKeys(raw);
+    // This installation's own old file counts even without known keys (an
+    // explicit unset); elsewhere such a file must not hide an older one.
+    if (legacyFile === ownLegacyFile || Object.keys(known).length > 0) {
+      return { values: known, file: legacyFile, legacy: true };
     }
   }
   return { values: {}, file, legacy: false };
@@ -314,8 +327,8 @@ export function loadUserConfig() {
 
 /**
  * Set (or, with `undefined`, remove) one per-user setting, written atomically
- * to the current file. Values still only in a legacy file are carried over on
- * this first write; the legacy file itself is left in place.
+ * to the current file. Known settings still only in a legacy file are carried
+ * over on this first write; the legacy file itself is left in place.
  */
 export function setUserConfigValue(key, value) {
   const filePath = resolveUserConfigFile();

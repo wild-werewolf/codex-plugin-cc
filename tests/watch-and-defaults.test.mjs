@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, TEST_PLUGIN_DATA } from "./helpers.mjs";
 import { resolveLegacyUserConfigFiles, resolveUserConfigFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -307,9 +307,10 @@ test("a default from the old CLAUDE_PLUGIN_DATA config.json is read and moved on
   assert.equal(readFakeState(statePath).lastThreadStart.approvalsReviewer, "user", "deny routes to the user reviewer");
   assert.equal(fs.existsSync(configFile), false, "reading does not write");
 
-  // First write migrates every legacy value into the new file and keeps the old file.
+  // First write migrates the known settings (not unknown keys) into the new
+  // file and keeps the old file as it was.
   run("node", [SCRIPT, "setup", "--default-approvals", "auto-review"], { cwd: repo, env: legacyEnv });
-  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review", somethingElse: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review" });
   assert.deepEqual(JSON.parse(fs.readFileSync(legacyFile, "utf8")), { defaultApprovals: "deny", somethingElse: 1 });
   const after = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout);
   assert.deepEqual(after.defaultApprovals, { mode: "auto-review", source: "plugin-default", file: configFile, configFile });
@@ -317,7 +318,7 @@ test("a default from the old CLAUDE_PLUGIN_DATA config.json is read and moved on
   // Once the new file exists it wins, even after unset.
   run("node", [SCRIPT, "setup", "--default-approvals", "unset"], { cwd: repo, env: legacyEnv });
   assert.equal(JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: legacyEnv }).stdout).defaultApprovals.mode, null);
-  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { somethingElse: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), {});
 });
 
 test("a default left in another installation's data directory is found and moved on the next write", () => {
@@ -372,4 +373,58 @@ test("an empty config.json of another installation does not hide an older one wi
   fs.writeFileSync(path.join(wildData, "config.json"), "{}");
   const own = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
   assert.equal(own.defaultApprovals.mode, null);
+});
+
+test("only known settings are taken from another installation's config.json", () => {
+  const { repo, env, configFile } = setupWithoutOverride();
+  const dataRoot = path.join(makeTempDir(), "plugins", "data");
+  const wildData = path.join(dataRoot, "codex-wild-codex");
+  fs.mkdirSync(wildData, { recursive: true });
+  // A newer `codex-*` directory of another plugin with only its own keys.
+  const foreignFile = path.join(dataRoot, "codex-something-else", "config.json");
+  const valueFile = path.join(dataRoot, "codex-openai-codex", "config.json");
+  fs.mkdirSync(path.dirname(foreignFile), { recursive: true });
+  fs.mkdirSync(path.dirname(valueFile), { recursive: true });
+  fs.writeFileSync(valueFile, JSON.stringify({ defaultApprovals: "auto-review", apiToken: "not ours" }));
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(valueFile, old, old);
+  fs.writeFileSync(foreignFile, JSON.stringify({ apiToken: "secret", defaultApprovalz: "deny" }));
+
+  const wildEnv = { ...env, CLAUDE_PLUGIN_DATA: wildData };
+  const report = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
+  assert.equal(report.defaultApprovals.file, valueFile, "a file without known keys is skipped like an empty one");
+  assert.equal(report.defaultApprovals.mode, "auto-review");
+
+  run("node", [SCRIPT, "setup", "--default-approvals", "deny"], { cwd: repo, env: wildEnv });
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "deny" }, "unknown keys are never copied");
+  assert.deepEqual(JSON.parse(fs.readFileSync(foreignFile, "utf8")), { apiToken: "secret", defaultApprovalz: "deny" });
+});
+
+test("tests never use the developer's CLAUDE_PLUGIN_DATA or settings from next to it", () => {
+  // Pretend the suite is started from a Claude Code session whose hook
+  // exported CLAUDE_PLUGIN_DATA, with a sibling installation's default set.
+  const dataRoot = path.join(makeTempDir(), "plugins", "data");
+  const sessionData = path.join(dataRoot, "codex-wild-codex");
+  const siblingFile = path.join(dataRoot, "codex-other", "config.json");
+  fs.mkdirSync(sessionData, { recursive: true });
+  fs.mkdirSync(path.dirname(siblingFile), { recursive: true });
+  fs.writeFileSync(siblingFile, JSON.stringify({ defaultApprovals: "auto-review" }));
+
+  const probe = path.join(ROOT, "tests", "fixtures", "env-isolation-probe.mjs");
+  const result = run("node", [probe], {
+    cwd: ROOT,
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: sessionData, CODEX_COMPANION_SESSION_ID: "real-session" }
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const report = JSON.parse(result.stdout.trim());
+  assert.notEqual(report.processPluginData, sessionData);
+  assert.equal(report.buildEnvPluginData, report.processPluginData);
+  assert.equal(report.sessionId, null);
+  assert.equal(report.defaultApprovals.mode, null, "the sibling's default must not be picked up");
+  assert.equal(report.taskStatus, 0);
+  assert.equal(report.reviewerSent, false);
+  assert.deepEqual(fs.readdirSync(sessionData), [], "nothing is written into the session's plugin data directory");
+  assert.deepEqual(JSON.parse(fs.readFileSync(siblingFile, "utf8")), { defaultApprovals: "auto-review" });
+  // This test file itself is isolated the same way.
+  assert.equal(process.env.CLAUDE_PLUGIN_DATA, TEST_PLUGIN_DATA);
 });

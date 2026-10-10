@@ -4,6 +4,22 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Isolate every test process from the developer's Claude Code session. Its
+// SessionStart hook exports CLAUDE_PLUGIN_DATA (and the session id and
+// transcript path) to every Bash command, so tests run from a session would
+// otherwise write job state into the real plugin data directory and read the
+// real per-user settings. The test process and all children it spawns
+// (directly or through buildEnv) share this temporary root, so state that a
+// test reads with resolveStateDir() is the state its commands wrote.
+export const TEST_ENV_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "codex-plugin-test-env-"));
+export const TEST_PLUGIN_DATA = path.join(TEST_ENV_ROOT, "plugin-data");
+export const TEST_USER_CONFIG_FILE = path.join(TEST_ENV_ROOT, "codex-companion-config.json");
+process.env.CLAUDE_PLUGIN_DATA = TEST_PLUGIN_DATA;
+process.env.CODEX_COMPANION_CONFIG_FILE = TEST_USER_CONFIG_FILE;
+for (const name of ["CODEX_COMPANION_SESSION_ID", "CODEX_COMPANION_TRANSCRIPT_PATH", "CODEX_COMPANION_APP_SERVER_ENDPOINT"]) {
+  delete process.env[name];
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-import { writeExecutable } from "./helpers.mjs";
+import { TEST_PLUGIN_DATA, writeExecutable } from "./helpers.mjs";
 
 export function installFakeCodex(binDir, behavior = "review-ok") {
   const statePath = path.join(binDir, "fake-codex-state.json");
@@ -799,7 +799,9 @@ export function buildEnv(binDir) {
   return {
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`,
-    // Keep tests away from the real per-user settings file.
+    // Keep tests away from the real plugin data directory (job state) and the
+    // real per-user settings file; see tests/helpers.mjs.
+    CLAUDE_PLUGIN_DATA: TEST_PLUGIN_DATA,
     CODEX_COMPANION_CONFIG_FILE: path.join(binDir, "codex-companion-config.json")
   };
 }
