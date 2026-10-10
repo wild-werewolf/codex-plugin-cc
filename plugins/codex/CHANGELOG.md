@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.6-approvals.4
+
+- On Windows the companion starts `codex -c windows.sandbox=mxc app-server` (direct and shared-broker runtimes alike). With the legacy `elevated` sandbox, Codex's per-command "setup refresh" fails while `node_repl.exe` is running (`os error 32`, [openai/codex#51822](https://github.com/openai/codex/pull/51822)), and every command was rejected with `helper_unknown_error: setup refresh had errors`. The override is per process; `~/.codex/config.toml` is untouched. `CODEX_COMPANION_WINDOWS_SANDBOX=config` passes no override, `mxc`/`elevated`/`unelevated` pass that value, anything else is an error. No fallback to another sandbox, and approval policy, reviewer and the thread sandbox are unchanged. Other platforms still run `codex app-server`.
+- `/codex:setup` shows the Windows sandbox and its source (`windowsSandbox` in `--json`, Windows only, informational).
+
 ## 1.0.6-approvals.3
 
 - `/codex:rescue` calls the `Agent` tool with `run_in_background: false` in every mode. The tool runs subagents in the background when the parameter is left out, so `--background` jobs reached the user only after a notification instead of within seconds. If the subagent still returns through a notification, Claude now starts `watch` right away from the launch line in it (also in the `codex-approvals` skill).

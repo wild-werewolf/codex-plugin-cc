@@ -16,7 +16,13 @@ export const TEST_PLUGIN_DATA = path.join(TEST_ENV_ROOT, "plugin-data");
 export const TEST_USER_CONFIG_FILE = path.join(TEST_ENV_ROOT, "codex-companion-config.json");
 process.env.CLAUDE_PLUGIN_DATA = TEST_PLUGIN_DATA;
 process.env.CODEX_COMPANION_CONFIG_FILE = TEST_USER_CONFIG_FILE;
-for (const name of ["CODEX_COMPANION_SESSION_ID", "CODEX_COMPANION_TRANSCRIPT_PATH", "CODEX_COMPANION_APP_SERVER_ENDPOINT"]) {
+// CODEX_COMPANION_WINDOWS_SANDBOX: tests expect the plugin default.
+for (const name of [
+  "CODEX_COMPANION_SESSION_ID",
+  "CODEX_COMPANION_TRANSCRIPT_PATH",
+  "CODEX_COMPANION_APP_SERVER_ENDPOINT",
+  "CODEX_COMPANION_WINDOWS_SANDBOX"
+]) {
   delete process.env[name];
 }
 
