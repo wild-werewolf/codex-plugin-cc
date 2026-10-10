@@ -348,3 +348,28 @@ test("a default left in another installation's data directory is found and moved
   assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "auto-review" });
   assert.deepEqual(JSON.parse(fs.readFileSync(openaiFile, "utf8")), { defaultApprovals: "auto-review" }, "the old file is kept");
 });
+
+test("an empty config.json of another installation does not hide an older one with a value", () => {
+  const { repo, env } = setupWithoutOverride();
+  const dataRoot = path.join(makeTempDir(), "plugins", "data");
+  const wildData = path.join(dataRoot, "codex-wild-codex");
+  fs.mkdirSync(wildData, { recursive: true });
+  const emptyFile = path.join(dataRoot, "codex-newer", "config.json");
+  const valueFile = path.join(dataRoot, "codex-openai-codex", "config.json");
+  fs.mkdirSync(path.dirname(emptyFile), { recursive: true });
+  fs.mkdirSync(path.dirname(valueFile), { recursive: true });
+  fs.writeFileSync(valueFile, JSON.stringify({ defaultApprovals: "auto-review" }));
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(valueFile, old, old);
+  fs.writeFileSync(emptyFile, "{}");
+
+  const wildEnv = { ...env, CLAUDE_PLUGIN_DATA: wildData };
+  const report = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
+  assert.equal(report.defaultApprovals.mode, "auto-review");
+  assert.equal(report.defaultApprovals.file, valueFile);
+
+  // This installation's own old file wins even when empty: that was an unset.
+  fs.writeFileSync(path.join(wildData, "config.json"), "{}");
+  const own = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: wildEnv }).stdout);
+  assert.equal(own.defaultApprovals.mode, null);
+});

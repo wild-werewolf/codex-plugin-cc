@@ -296,9 +296,12 @@ export function readUserConfig() {
   if (current) {
     return { values: current, file, legacy: false };
   }
+  const ownLegacyFile = process.env[PLUGIN_DATA_ENV] ? path.join(process.env[PLUGIN_DATA_ENV], USER_CONFIG_FILE_NAME) : null;
   for (const legacyFile of resolveLegacyUserConfigFiles()) {
     const legacy = readConfigObject(legacyFile);
-    if (legacy) {
+    // This installation's own old file counts even when empty (an explicit
+    // unset); an empty file elsewhere must not hide an older one with values.
+    if (legacy && (legacyFile === ownLegacyFile || Object.keys(legacy).length > 0)) {
       return { values: legacy, file: legacyFile, legacy: true };
     }
   }
