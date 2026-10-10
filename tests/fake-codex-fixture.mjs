@@ -331,7 +331,14 @@ function taskPayload(prompt, resume) {
   return "Handled the requested task.\\nTask prompt accepted.";
 }
 
-const args = process.argv.slice(2);
+const argv = process.argv.slice(2);
+// Global \`-c key=value\` config overrides precede the subcommand, as in the
+// real CLI (\`codex -c windows.sandbox=mxc app-server\`).
+let firstCommandArg = 0;
+while (argv[firstCommandArg] === "-c" && argv[firstCommandArg + 1] !== undefined) {
+  firstCommandArg += 2;
+}
+const args = argv.slice(firstCommandArg);
 if (args[0] === "--version") {
   console.log("codex-cli test");
   process.exit(0);
@@ -360,6 +367,8 @@ if (args[0] !== "app-server") {
 }
 const bootState = loadState();
 bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+// The full argument list of every app-server start, in order.
+bootState.appServerArgs = [...(bootState.appServerArgs || []), argv];
 saveState(bootState);
 
 const rl = readline.createInterface({ input: process.stdin });

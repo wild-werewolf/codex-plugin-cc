@@ -177,6 +177,18 @@ function appendReasoningSection(lines, reasoningSummary) {
   }
 }
 
+function renderWindowsSandboxLine(windowsSandbox) {
+  if (windowsSandbox.error) {
+    return `- windows sandbox: invalid (${windowsSandbox.error})`;
+  }
+  if (windowsSandbox.mode === "config") {
+    return "- windows sandbox: from your Codex config (CODEX_COMPANION_WINDOWS_SANDBOX=config)";
+  }
+  return windowsSandbox.source === "env"
+    ? `- windows sandbox: ${windowsSandbox.mode} (CODEX_COMPANION_WINDOWS_SANDBOX)`
+    : `- windows sandbox: ${windowsSandbox.mode} (plugin default; set CODEX_COMPANION_WINDOWS_SANDBOX=config to use your Codex config)`;
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -199,6 +211,7 @@ export function renderSetupReport(report) {
               : `- default approvals: ${report.defaultApprovals.mode} (plugin default from ${report.defaultApprovals.file})`
         ]
       : []),
+    ...(report.windowsSandbox ? [renderWindowsSandboxLine(report.windowsSandbox)] : []),
     ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
     ""
   ];

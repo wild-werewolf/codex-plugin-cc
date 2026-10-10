@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { createBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
@@ -2257,3 +2258,153 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
 });
+
+// The arguments the companion passes to \`codex\` for the app-server on this
+// platform (CODEX_COMPANION_WINDOWS_SANDBOX is cleared in tests/helpers.mjs).
+const EXPECTED_APP_SERVER_ARGS = process.platform === "win32" ? ["-c", "windows.sandbox=mxc", "app-server"] : ["app-server"];
+
+function setupTaskRepo() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+function readAppServerArgs(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8")).appServerArgs;
+}
+
+// A broker endpoint nobody listens on: the task fails over to a direct
+// \`codex app-server\` (ENOENT on the requested broker).
+function directTaskEnv(binDir, extra = {}) {
+  return {
+    ...buildEnv(binDir),
+    CODEX_COMPANION_APP_SERVER_ENDPOINT: createBrokerEndpoint(makeTempDir("codex-no-broker-")),
+    ...extra
+  };
+}
+
+test("fake codex accepts global -c overrides before the subcommand", async () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const fakeCodex = path.join(binDir, "codex");
+
+  const help = run(process.execPath, [fakeCodex, "-c", "windows.sandbox=mxc", "app-server", "--help"]);
+  assert.equal(help.status, 0, help.stderr);
+  assert.match(help.stdout, /fake app-server help/);
+
+  const child = spawn(process.execPath, [fakeCodex, "-c", "windows.sandbox=mxc", "app-server"], {
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk;
+  });
+  child.stdin.write(`${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "t" }, capabilities: {} } })}\n`);
+  try {
+    await waitFor(() => stdout.includes('"id":1'));
+    assert.match(stdout, /"result"/);
+  } finally {
+    child.stdin.end();
+    child.kill();
+  }
+  assert.deepEqual(readAppServerArgs(binDir), [["-c", "windows.sandbox=mxc", "app-server"]]);
+});
+
+test("a direct task starts codex app-server with the platform's sandbox arguments", () => {
+  const repo = setupTaskRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const result = run("node", [SCRIPT, "task", "check app-server args"], {
+    cwd: repo,
+    env: directTaskEnv(binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+  assert.equal(loadBrokerSession(repo), null);
+  assert.deepEqual(readAppServerArgs(binDir), [EXPECTED_APP_SERVER_ARGS]);
+});
+
+test("the shared broker starts its codex app-server with the same sandbox arguments", () => {
+  const repo = setupTaskRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  const env = buildEnv(binDir);
+
+  const result = run("node", [SCRIPT, "task", "check broker app-server args"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  try {
+    assert.ok(loadBrokerSession(repo), "the first task should start the shared broker");
+    // One app-server, started by the broker, with the same arguments.
+    assert.deepEqual(readAppServerArgs(binDir), [EXPECTED_APP_SERVER_ARGS]);
+  } finally {
+    const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+    assert.equal(cleanup.status, 0, cleanup.stderr);
+  }
+});
+
+test(
+  "outside Windows codex app-server gets no sandbox override, whatever CODEX_COMPANION_WINDOWS_SANDBOX says",
+  { skip: process.platform === "win32" ? "Windows-only override" : false },
+  () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+
+    for (const value of ["elevated", "not-a-sandbox"]) {
+      const repo = setupTaskRepo();
+      const result = run("node", [SCRIPT, "task", "check app-server args"], {
+        cwd: repo,
+        env: directTaskEnv(binDir, { CODEX_COMPANION_WINDOWS_SANDBOX: value })
+      });
+      assert.equal(result.status, 0, result.stderr);
+    }
+
+    assert.deepEqual(readAppServerArgs(binDir), [["app-server"], ["app-server"]]);
+
+    const setup = run("node", [SCRIPT, "setup", "--json"], {
+      cwd: ROOT,
+      env: buildEnv(binDir)
+    });
+    assert.equal(setup.status, 0, setup.stderr);
+    const payload = JSON.parse(setup.stdout);
+    assert.equal(payload.ready, true);
+    assert.equal("windowsSandbox" in payload, false);
+  }
+);
+
+test(
+  "on Windows setup reports the MXC sandbox and an invalid override stops a task before Codex runs",
+  { skip: process.platform === "win32" ? false : "Windows only" },
+  () => {
+    const binDir = makeTempDir();
+    installFakeCodex(binDir);
+
+    const setup = run("node", [SCRIPT, "setup", "--json"], { cwd: ROOT, env: buildEnv(binDir) });
+    assert.equal(setup.status, 0, setup.stderr);
+    const payload = JSON.parse(setup.stdout);
+    assert.equal(payload.ready, true);
+    assert.deepEqual(payload.windowsSandbox, { mode: "mxc", source: "plugin-default" });
+
+    const repo = setupTaskRepo();
+    const invalid = run("node", [SCRIPT, "task", "check invalid sandbox"], {
+      cwd: repo,
+      env: { ...buildEnv(binDir), CODEX_COMPANION_WINDOWS_SANDBOX: "bogus" }
+    });
+    assert.notEqual(invalid.status, 0);
+    assert.match(invalid.stderr, /Unsupported CODEX_COMPANION_WINDOWS_SANDBOX="bogus"/);
+  }
+);

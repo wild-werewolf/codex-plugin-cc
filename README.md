@@ -271,6 +271,19 @@ It also shows the default approval mode and where it comes from, and reports whe
 
 You can also use `/codex:setup` to manage the optional review gate.
 
+On Windows it also shows which Windows sandbox the plugin asks Codex to use (see below). This line is informational too.
+
+#### Windows sandbox (MXC)
+
+On Windows the plugin starts `codex app-server` as `codex -c windows.sandbox=mxc app-server`, the newer MXC sandbox that the Codex app itself prefers. With the older `elevated` sandbox, Codex runs a "setup refresh" before every command that fails while the `node_repl.exe` runtime is in use (`os error 32`, then `helper_unknown_error: setup refresh had errors`), so every command is rejected before it runs ([openai/codex#51822](https://github.com/openai/codex/pull/51822), not yet fixed in Codex 0.162.1). The override applies only to that process; `~/.codex/config.toml` is not changed, and approval policy, approval reviewer and the `read-only`/`workspace-write` sandbox stay as before. If MXC is not available, Codex's own error is shown; the plugin does not fall back to another sandbox.
+
+To choose differently, set `CODEX_COMPANION_WINDOWS_SANDBOX` in the environment Claude Code starts in:
+
+- `config`: pass no override, so `windows.sandbox` from your Codex config applies;
+- `mxc`, `elevated`, or `unelevated`: pass that value instead.
+
+Any other value is an error. The variable is ignored on macOS and Linux, where the plugin keeps running `codex app-server`. A shared runtime that is already running keeps the setting it was started with until the Claude session ends.
+
 #### Default approval mode
 
 ```bash

@@ -23,6 +23,21 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
 
+// Windows sandbox implementation for the `codex app-server` the companion
+// starts. The legacy elevated sandbox runs a "setup refresh" before every
+// command that fails while a runtime EXE (node_repl.exe) is in use
+// (openai/codex#51822), so every command is rejected; the MXC sandbox does not
+// have that step. Passed as a one-off `-c windows.sandbox=<value>` override for
+// that process only; ~/.codex/config.toml is not touched.
+export const WINDOWS_SANDBOX_ENV = "CODEX_COMPANION_WINDOWS_SANDBOX";
+export const WINDOWS_SANDBOX_DEFAULT = "mxc";
+// "config": pass no override, so the user's Codex config decides.
+export const WINDOWS_SANDBOX_CONFIG = "config";
+// The values of WindowsSandboxImplementation in the Codex config schema
+// (`codex app-server generate-json-schema`, Codex 0.162). Only these reach the
+// command line: on Windows `codex` is started through a shell.
+export const WINDOWS_SANDBOX_VALUES = Object.freeze(["mxc", "elevated", "unelevated"]);
+
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
   title: "Codex Plugin",
@@ -53,6 +68,61 @@ function createProtocolError(message, data) {
     error.rpcCode = data.code;
   }
   return error;
+}
+
+/**
+ * The Windows sandbox the companion asks `codex app-server` to use, or null
+ * off Windows (where CODEX_COMPANION_WINDOWS_SANDBOX is ignored).
+ *
+ * @param {{ platform?: string, env?: Record<string, string | undefined> }} [options]
+ * @returns {{ mode: string, source: "plugin-default" | "env" } | null}
+ */
+export function resolveWindowsSandbox({ platform = process.platform, env = process.env } = {}) {
+  if (platform !== "win32") {
+    return null;
+  }
+  const raw = env?.[WINDOWS_SANDBOX_ENV];
+  if (raw === undefined || raw.trim() === "") {
+    return { mode: WINDOWS_SANDBOX_DEFAULT, source: "plugin-default" };
+  }
+  const value = raw.trim().toLowerCase();
+  if (value !== WINDOWS_SANDBOX_CONFIG && !WINDOWS_SANDBOX_VALUES.includes(value)) {
+    throw new Error(
+      `Unsupported ${WINDOWS_SANDBOX_ENV}=${JSON.stringify(raw)}. Use one of: ${[...WINDOWS_SANDBOX_VALUES, WINDOWS_SANDBOX_CONFIG].join(", ")} ` +
+        `("${WINDOWS_SANDBOX_CONFIG}" keeps the windows.sandbox setting from your Codex config).`
+    );
+  }
+  return { mode: value, source: "env" };
+}
+
+/**
+ * The Windows sandbox for `/codex:setup`: informational, never throws. An
+ * unsupported CODEX_COMPANION_WINDOWS_SANDBOX is reported with its error.
+ *
+ * @param {{ platform?: string, env?: Record<string, string | undefined> }} [options]
+ */
+export function describeWindowsSandbox({ platform = process.platform, env = process.env } = {}) {
+  try {
+    return resolveWindowsSandbox({ platform, env });
+  } catch (error) {
+    return { mode: null, source: "env", error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Arguments for the `codex` process that runs the app-server. Only the
+ * process that executes commands gets the sandbox override; `codex --version`
+ * and `codex app-server --help|generate-json-schema` run nothing.
+ *
+ * @param {{ platform?: string, env?: Record<string, string | undefined> }} [options]
+ * @returns {string[]}
+ */
+export function buildAppServerSpawnArgs({ platform = process.platform, env = process.env } = {}) {
+  const sandbox = resolveWindowsSandbox({ platform, env });
+  if (!sandbox || sandbox.mode === WINDOWS_SANDBOX_CONFIG) {
+    return ["app-server"];
+  }
+  return ["-c", `windows.sandbox=${sandbox.mode}`, "app-server"];
 }
 
 class AppServerClientBase {
@@ -223,9 +293,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   }
 
   async initialize() {
-    this.proc = spawn("codex", ["app-server"], {
+    const env = this.options.env ?? process.env;
+    this.proc = spawn("codex", buildAppServerSpawnArgs({ env }), {
       cwd: this.cwd,
-      env: this.options.env ?? process.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
       windowsHide: true
@@ -380,6 +451,9 @@ export class CodexAppServerClient {
         brokerEndpoint = loadBrokerSession(cwd)?.endpoint ?? null;
       }
       if (!brokerEndpoint && !options.reuseExistingBroker) {
+        // Reject an unsupported CODEX_COMPANION_WINDOWS_SANDBOX here rather
+        // than after the broker failed to start its app-server.
+        buildAppServerSpawnArgs({ env: options.env ?? process.env });
         const brokerSession = await ensureBrokerSession(cwd, { env: options.env });
         brokerEndpoint = brokerSession?.endpoint ?? null;
       }

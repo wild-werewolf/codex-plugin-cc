@@ -34,6 +34,7 @@ import {
   recordApprovalDecision,
   resolveApprovalMode
 } from "./lib/approvals.mjs";
+import { describeWindowsSandbox } from "./lib/app-server.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -222,6 +223,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   const codexStatus = getCodexAvailability(cwd);
   const authStatus = await getCodexAuthStatus(cwd);
   const config = getConfig(workspaceRoot);
+  // Informational only, Windows only: does not change `ready`.
+  const windowsSandbox = describeWindowsSandbox();
   // Informational only: protocol drift is reported but does not change `ready`.
   const protocol = codexStatus.available
     ? summarizeProtocolCheck(runProtocolCheck(cwd))
@@ -234,6 +237,9 @@ async function buildSetupReport(cwd, actionsTaken = []) {
   if (codexStatus.available && !authStatus.loggedIn && authStatus.requiresOpenaiAuth) {
     nextSteps.push("Run `!codex login`.");
     nextSteps.push("If browser login is blocked, retry with `!codex login --device-auth` or `!codex login --with-api-key`.");
+  }
+  if (windowsSandbox?.error) {
+    nextSteps.push("Set CODEX_COMPANION_WINDOWS_SANDBOX to mxc, elevated, unelevated or config, or unset it.");
   }
   if (!config.stopReviewGate) {
     nextSteps.push("Optional: run `/codex:setup --enable-review-gate` to require a fresh review before stop.");
@@ -248,6 +254,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     defaultApprovals: describeDefaultApprovals(),
+    ...(windowsSandbox ? { windowsSandbox } : {}),
     protocol,
     actionsTaken,
     nextSteps
