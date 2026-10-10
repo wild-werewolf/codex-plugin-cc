@@ -105,18 +105,21 @@ async function main() {
   // app-server request id. Ids are kept as-is: clients tell them apart from
   // their own responses because server requests carry a `method`.
   const forwardedServerRequests = new Map();
-  // Idle tracking: the broker exits after `idle.idleMs` without an active
-  // request, an active turn stream or a forwarded server request (an approval
-  // the user has not answered yet counts as work). Any connection or message
-  // also restarts the clock, so a client that just checked the endpoint is not
-  // cut off before its first request.
+  // Idle tracking: the broker exits after `idle.idleMs` without a connected
+  // client, an active request, an active turn stream or a forwarded server
+  // request (an approval the user has not answered yet counts as work). A
+  // connected client counts even while it sends nothing: a task sits between
+  // `initialize` and `thread/start` for as long as its process takes, and
+  // must not lose the broker midway (EPIPE, or a second broker for one task).
+  // The readiness probe closes its socket at once, so it does not keep the
+  // broker up. Connections, messages and disconnects restart the clock.
   let lastActivityAt = Date.now();
   let shuttingDown = false;
   function touch() {
     lastActivityAt = Date.now();
   }
   function isBusy() {
-    return Boolean(activeRequestSocket || activeStreamSocket || forwardedServerRequests.size > 0);
+    return Boolean(sockets.size > 0 || activeRequestSocket || activeStreamSocket || forwardedServerRequests.size > 0);
   }
 
   function settleForwardedRequests(socket) {
@@ -366,11 +369,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      touch();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      touch();
     });
   });
 

@@ -6,10 +6,14 @@ import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
+import net from "node:net";
+
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import {
   BROKER_IDLE_ENV,
   DEFAULT_BROKER_IDLE_MS,
+  ensureBrokerSession,
   loadBrokerSession,
   resolveBrokerIdleMs
 } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
@@ -17,9 +21,10 @@ import {
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(ROOT, "plugins", "codex", "scripts", "codex-companion.mjs");
 const SESSION_HOOK = path.join(ROOT, "plugins", "codex", "scripts", "session-lifecycle-hook.mjs");
-// Small enough for a quick test, large enough that a broker never idles out
-// between two requests of one command.
-const TEST_IDLE_MS = "400";
+// Small enough for a quick test, large enough that a broker does not idle out
+// between the end of a `task` command and the test's look at broker.json
+// (slower process start and exit on Windows).
+const TEST_IDLE_MS = process.platform === "win32" ? "3000" : "400";
 
 async function waitFor(predicate, { timeoutMs = 15000, intervalMs = 50 } = {}) {
   const start = Date.now();
@@ -136,7 +141,7 @@ test("a stale broker.json left by a dead broker breaks neither setup nor the nex
   const secondBroker = loadBrokerSession(repo);
   assert.ok(secondBroker);
   assert.notEqual(secondBroker.pid, firstBroker.pid);
-}, { skip: process.platform === "win32" ? "SIGKILL is not a distinct signal on Windows" : false });
+});
 
 test("the broker stays up while an approval waits for the user, longer than its idle timeout", async (t) => {
   const { repo, env, readFakeState } = setupRepo(t, "approval-command", TEST_IDLE_MS);
@@ -200,6 +205,48 @@ test("with an idle timeout of 0 the broker stays until SessionEnd", async (t) =>
     input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
   });
   assert.equal(ended.status, 0, ended.stderr);
+  await waitFor(() => !processAlive(broker.pid));
+  await waitFor(() => !processAlive(appServerPid));
+  assert.equal(loadBrokerSession(repo), null);
+});
+
+test("a connected client keeps the broker up while it is quiet; the broker idles out after it leaves", async (t) => {
+  const { repo, env, readFakeState } = setupRepo(t, "review-ok", TEST_IDLE_MS);
+  const broker = await ensureBrokerSession(repo, { env, timeoutMs: 10000 });
+  assert.ok(broker, "the broker should start");
+  t.after(() => {
+    if (processAlive(broker.pid)) {
+      process.kill(broker.pid);
+    }
+  });
+
+  // Like a task between `initialize` and `thread/start`: connected, silent.
+  const socket = net.createConnection({ path: parseBrokerEndpoint(broker.endpoint).path });
+  socket.setEncoding("utf8");
+  const initialized = new Promise((resolve, reject) => {
+    let buffer = "";
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      if (buffer.includes("\n")) {
+        resolve(JSON.parse(buffer.slice(0, buffer.indexOf("\n"))));
+      }
+    });
+    socket.on("error", reject);
+  });
+  await new Promise((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  socket.write(`${JSON.stringify({ id: 1, method: "initialize", params: {} })}\n`);
+  assert.equal((await initialized).id, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, Number(TEST_IDLE_MS) * 3));
+  assert.ok(processAlive(broker.pid), "the broker must not idle out under a connected client");
+  assert.ok(!socket.destroyed, "the client connection must stay open");
+  const [appServerPid] = readFakeState().appServerPids;
+  assert.ok(processAlive(appServerPid));
+
+  socket.end();
   await waitFor(() => !processAlive(broker.pid));
   await waitFor(() => !processAlive(appServerPid));
   assert.equal(loadBrokerSession(repo), null);

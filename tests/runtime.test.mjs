@@ -2317,27 +2317,49 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   assert.match(result.stdout, /Session runtime: shared session/);
 });
 
+// A `codex` that is on PATH but unusable (`--version` fails). It shadows a
+// real Codex on the developer's machine, so setup reports Codex unavailable
+// and never connects to anything.
+function installUnavailableCodex(binDir) {
+  fs.writeFileSync(path.join(binDir, "codex"), "#!/bin/sh\nexit 1\n", { encoding: "utf8", mode: 0o755 });
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(binDir, "codex.cmd"), "@exit /b 1\r\n", "utf8");
+  }
+}
+
 test("setup and status honor --cwd when reading shared session runtime", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
+  const binDir = makeTempDir();
+  installUnavailableCodex(binDir);
+  // The broker.json below points at nobody. With a usable Codex, setup's auth
+  // check would find that broker dead and forget it (as it should); this test
+  // is only about which workspace's broker.json is read.
+  const env = buildEnv(binDir);
 
   saveBrokerSession(targetWorkspace, {
     endpoint: "unix:/tmp/fake-broker.sock"
   });
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Session runtime: shared session/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
+  assert.equal(payload.codex.available, false, "the test must not reach a real Codex");
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  // The invocation workspace has no broker.json of its own.
+  const invocationSetup = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: invocationWorkspace, env }).stdout);
+  assert.equal(invocationSetup.sessionRuntime.mode, "direct");
 });
 
 // The arguments the companion passes to \`codex\` for the app-server on this
