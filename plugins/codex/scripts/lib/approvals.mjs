@@ -10,7 +10,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { loadUserConfig, resolveJobsDir, resolveUserConfigFile } from "./state.mjs";
+import { readUserConfig, resolveJobsDir } from "./state.mjs";
 
 export const APPROVAL_MODES = ["ask", "auto-review", "deny"];
 export const APPROVAL_DECISIONS = ["accept", "decline"];
@@ -56,12 +56,19 @@ export const DEFAULT_APPROVALS_CONFIG_KEY = "defaultApprovals";
  * An unreadable or unknown value counts as not set.
  */
 export function readDefaultApprovalMode() {
-  const value = loadUserConfig()[DEFAULT_APPROVALS_CONFIG_KEY];
+  return describeDefaultApprovalMode().mode;
+}
+
+/** The default mode plus the file it was read from (possibly a legacy one). */
+export function describeDefaultApprovalMode() {
+  const config = readUserConfig();
+  let mode = null;
   try {
-    return normalizeApprovalMode(value);
+    mode = normalizeApprovalMode(config.values[DEFAULT_APPROVALS_CONFIG_KEY]);
   } catch {
-    return null;
+    mode = null;
   }
+  return { mode, file: config.file, legacy: Boolean(mode) && config.legacy };
 }
 
 /**
@@ -73,9 +80,9 @@ export function resolveApprovalMode(explicit) {
   if (fromFlag) {
     return { mode: fromFlag, source: "flag" };
   }
-  const fromDefault = readDefaultApprovalMode();
-  if (fromDefault) {
-    return { mode: fromDefault, source: "plugin-default", file: resolveUserConfigFile() };
+  const fromDefault = describeDefaultApprovalMode();
+  if (fromDefault.mode) {
+    return { mode: fromDefault.mode, source: "plugin-default", file: fromDefault.file };
   }
   return { mode: null, source: "codex-config" };
 }

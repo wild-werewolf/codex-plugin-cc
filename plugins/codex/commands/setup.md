@@ -35,4 +35,4 @@ Output rules:
 - Present the final setup output to the user.
 - If installation was skipped, present the original setup output.
 - If Codex is installed but not authenticated, preserve the guidance to run `!codex login`.
-- Show the `defaultApprovals` value and where it comes from: a plugin default (`mode` and `file`) or not set, in which case the `approvals_reviewer` from the user's Codex config applies.
+- Show the `defaultApprovals` value and where it comes from: a plugin default (`mode` and the actual `file`), a plugin default still read from the old location (`source: plugin-default-legacy`; the next `--default-approvals` change saves it to `configFile`), or not set, in which case the `approvals_reviewer` from the user's Codex config applies.

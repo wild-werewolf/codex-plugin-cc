@@ -90,6 +90,7 @@ test("rescue command absorbs continue semantics", () => {
   const agent = read("agents/codex-rescue.md");
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
   const runtimeSkill = read("skills/codex-cli-runtime/SKILL.md");
+  const approvalsSkill = read("skills/codex-approvals/SKILL.md");
 
   assert.match(rescue, /The final user-visible response must be Codex's output verbatim/i);
   assert.match(rescue, /allowed-tools:\s*Bash\(node:\*\),\s*AskUserQuestion,\s*Agent,\s*Skill/);
@@ -114,7 +115,13 @@ test("rescue command absorbs continue semantics", () => {
   // approvals); the subagent itself runs in the foreground and the main
   // thread follows the job with `watch`.
   assert.match(rescue, /Keep `--background` in the forwarded request so the subagent passes it to `task`/i);
-  assert.match(rescue, /run the `codex:codex-rescue` subagent in the foreground \(do not set `run_in_background` on the `Agent` call\)/i);
+  // The Agent tool backgrounds subagents when `run_in_background` is left
+  // out, so the command must pass `false` explicitly in every mode.
+  assert.match(rescue, /subagent_type: "codex:codex-rescue"`, `run_in_background: false`/);
+  assert.match(rescue, /In every mode \(`--background`, `--wait`, or neither\), call the `Agent` tool with `run_in_background: false` explicitly/);
+  assert.doesNotMatch(rescue, /do not set `run_in_background`/i);
+  assert.match(rescue, /Fallback: if the subagent ran in the background anyway[\s\S]*start `watch <job-id> --json` immediately/);
+  assert.match(approvalsSkill, /inside the notification of a subagent that ran in the background/);
   assert.doesNotMatch(rescue, /run the `codex:codex-rescue` subagent in the background/i);
   assert.match(rescue, /default to foreground/i);
   assert.match(rescue, /`--wait` is not forwarded to `task`/i);

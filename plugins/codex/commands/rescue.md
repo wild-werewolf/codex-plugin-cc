@@ -4,7 +4,7 @@ argument-hint: "[--background|--wait] [--resume|--fresh] [--approvals <ask|auto-
 allowed-tools: Bash(node:*), AskUserQuestion, Agent, Skill
 ---
 
-Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
+Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`, `run_in_background: false`), forwarding the raw user request as the prompt.
 `codex:codex-rescue` is a subagent, not a skill — do not call `Skill(codex:codex-rescue)` (no such skill) or `Skill(codex:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
 
@@ -13,9 +13,10 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, Codex runs as a detached background job of the companion, because only such a job can wait for approval answers. Keep `--background` in the forwarded request so the subagent passes it to `task`, and run the `codex:codex-rescue` subagent in the foreground (do not set `run_in_background` on the `Agent` call): it returns within seconds with the job id.
-- If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground. `--wait` is not forwarded to `task`.
-- If neither flag is present, default to foreground.
+- In every mode (`--background`, `--wait`, or neither), call the `Agent` tool with `run_in_background: false` explicitly. The `Agent` tool runs subagents in the background when the parameter is left out, so always pass it.
+- If the request includes `--background`, Codex runs as a detached background job of the companion, because only such a job can wait for approval answers. Keep `--background` in the forwarded request so the subagent passes it to `task`; with `run_in_background: false` the subagent returns within seconds with the job id.
+- If the request includes `--wait`, the subagent runs Codex to completion. `--wait` is not forwarded to `task`.
+- If neither flag is present, default to foreground: the subagent decides only whether `task` gets `--background`.
 - Do not treat `--background` or `--wait` as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - `--approvals <ask|auto-review|deny>` is a runtime flag too. Preserve it for the forwarded `task` call. Never add it yourself.
@@ -44,6 +45,7 @@ Operating rules:
 - Return the Codex companion stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - If that stdout is a background launch line (`... started in the background as <job-id>. ...`), follow the job right away with the `codex:codex-approvals` skill (load it with the `Skill` tool): start `watch <job-id> --json` with `Bash` and `run_in_background: true`, ask the user about each approval request it reports, and show `result <job-id>` verbatim when the job is done. This follow-up is yours, not the subagent's.
+- Fallback: if the subagent ran in the background anyway (some sessions do not allow a foreground `Agent` call) and its result reaches you as a notification, do the same as soon as that notification arrives: take `<job-id>` from the launch line in it and start `watch <job-id> --json` immediately. Do not wait for anything else first.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.

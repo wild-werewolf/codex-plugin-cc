@@ -278,7 +278,15 @@ You can also use `/codex:setup` to manage the optional review gate.
 /codex:setup --default-approvals unset
 ```
 
-Sets the approval mode (`ask`, `auto-review`, or `deny`) used by `/codex:rescue`, `/codex:review`, and `/codex:adversarial-review` in every repository when you do not pass `--approvals`. It is stored once per user in `${CLAUDE_PLUGIN_DATA}/config.json` (or `config.json` in the plugin's temp-dir state root when `CLAUDE_PLUGIN_DATA` is not set). An explicit `--approvals` always wins; `unset` removes the default so the `approvals_reviewer` from your Codex config applies again. A background job keeps the mode it was started with.
+Sets the approval mode (`ask`, `auto-review`, or `deny`) used by `/codex:rescue`, `/codex:review`, and `/codex:adversarial-review` in every repository when you do not pass `--approvals`. An explicit `--approvals` always wins; `unset` removes the default so the `approvals_reviewer` from your Codex config applies again. A background job keeps the mode it was started with.
+
+The setting is stored once per user, outside the plugin's data directory, so it survives reinstalling the plugin or installing it from another marketplace:
+
+- Windows: `%APPDATA%\codex-companion\config.json`
+- macOS and Linux: `${XDG_CONFIG_HOME:-~/.config}/codex-companion/config.json`
+- anywhere else: set `CODEX_COMPANION_CONFIG_FILE` to the full path of the file
+
+`/codex:setup` shows the mode, where it comes from, and the actual file. Releases up to `1.0.6-approvals.2` kept it in `${CLAUDE_PLUGIN_DATA}/config.json`, a directory named after the plugin and its marketplace (for example `~/.claude/plugins/data/codex-openai-codex`). While the new file does not exist yet, that old file is still read (and if this installation has none, the newest `config.json` of another installation next to it that holds a plugin setting, for example `codex-openai-codex` when you now use `codex-wild-codex`), and `/codex:setup` says which file it came from; the next `/codex:setup --default-approvals ...` writes the new file, carrying over only the plugin's own settings (`defaultApprovals`) and leaving the old file in place. To move the setting to another machine, copy the file. To reset it, run `/codex:setup --default-approvals unset` or delete the file. Job state (`state.json`, jobs) stays in `CLAUDE_PLUGIN_DATA`.
 
 #### Enabling review gate
 

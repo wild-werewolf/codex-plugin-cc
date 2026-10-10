@@ -18,6 +18,7 @@ Companion script: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs"`.
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" watch <job-id> --json
 ```
 
+- The launch line can also arrive late, inside the notification of a subagent that ran in the background. Treat it the same way: take `<job-id>` from that line and start `watch` at once.
 - Do not poll `/codex:status` yourself, do not use `sleep`, and do not wait in the foreground. The background `Bash` call notifies you when `watch` exits.
 - `watch` prints exactly one JSON line. Act on its `event`:
   - `approval`: answer every entry in `pending` as described below, then start `watch <job-id> --json` again in the background.

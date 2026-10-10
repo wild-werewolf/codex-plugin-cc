@@ -30,7 +30,7 @@ import {
   APPROVAL_MODES,
   DEFAULT_APPROVALS_CONFIG_KEY,
   normalizeApprovalMode,
-  readDefaultApprovalMode,
+  describeDefaultApprovalMode,
   recordApprovalDecision,
   resolveApprovalMode
 } from "./lib/approvals.mjs";
@@ -205,11 +205,13 @@ function firstMeaningfulLine(text, fallback) {
 }
 
 function describeDefaultApprovals() {
-  const mode = readDefaultApprovalMode();
+  const { mode, file, legacy } = describeDefaultApprovalMode();
   return {
     mode,
-    source: mode ? "plugin-default" : "codex-config",
-    file: resolveUserConfigFile()
+    source: mode ? (legacy ? "plugin-default-legacy" : "plugin-default") : "codex-config",
+    // The file the value was read from, and where setup writes.
+    file: mode ? file : resolveUserConfigFile(),
+    configFile: resolveUserConfigFile()
   };
 }
 
