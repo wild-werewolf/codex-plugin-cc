@@ -42,7 +42,7 @@ import path from "node:path";
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
 import { buildApprovalRoutingParams } from "./approvals.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { loadBrokerSession, resolveBrokerIdleMs } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -974,13 +974,23 @@ export function getCodexAvailability(cwd) {
   };
 }
 
+function describeBrokerIdle(env) {
+  const { idleMs } = resolveBrokerIdleMs(env);
+  if (idleMs === 0) {
+    return " until the session ends";
+  }
+  return idleMs % 60000 === 0
+    ? `; it stops after ${idleMs / 60000} minute(s) without work`
+    : `; it stops after ${idleMs} ms without work`;
+}
+
 export function getSessionRuntimeStatus(env = process.env, cwd = process.cwd()) {
   const endpoint = env?.[BROKER_ENDPOINT_ENV] ?? loadBrokerSession(cwd)?.endpoint ?? null;
   if (endpoint) {
     return {
       mode: "shared",
       label: "shared session",
-      detail: "This Claude session is configured to reuse one shared Codex runtime.",
+      detail: `This Claude session is configured to reuse one shared Codex runtime${describeBrokerIdle(env)}.`,
       endpoint
     };
   }

@@ -1,3 +1,5 @@
+import { formatApprovalResumeHint } from "./approvals.mjs";
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -211,6 +213,20 @@ function renderWindowsPowerShellLine(windowsPowerShell) {
   );
 }
 
+function renderApprovalTimeoutLine(approvalTimeout) {
+  const value = Number.isInteger(approvalTimeout.minutes)
+    ? `${approvalTimeout.minutes} minute${approvalTimeout.minutes === 1 ? "" : "s"}`
+    : `${approvalTimeout.timeoutMs} ms`;
+  switch (approvalTimeout.source) {
+    case "env":
+      return `- approval timeout: ${value} (from ${approvalTimeout.env}, which overrides \`--approval-timeout\`)`;
+    case "plugin-default":
+      return `- approval timeout: ${value} (plugin setting from ${approvalTimeout.file})`;
+    default:
+      return `- approval timeout: ${value} (default; change it with \`/codex:setup --approval-timeout <minutes>\`)`;
+  }
+}
+
 export function renderSetupReport(report) {
   const lines = [
     "# Codex Setup",
@@ -233,6 +249,7 @@ export function renderSetupReport(report) {
               : `- default approvals: ${report.defaultApprovals.mode} (plugin default from ${report.defaultApprovals.file})`
         ]
       : []),
+    ...(report.approvalTimeout ? [renderApprovalTimeoutLine(report.approvalTimeout)] : []),
     ...(report.windowsSandbox ? [renderWindowsSandboxLine(report.windowsSandbox)] : []),
     ...(report.windowsPowerShell ? [renderWindowsPowerShellLine(report.windowsPowerShell)] : []),
     ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
@@ -371,6 +388,8 @@ const APPROVAL_SOURCE_LABELS = {
   closed: "the Codex connection closed before an answer"
 };
 
+const UNANSWERED_APPROVAL_SOURCES = new Set(["timeout", "resolved-by-server", "closed"]);
+
 export function renderApprovalSection(approvals) {
   if (!Array.isArray(approvals) || approvals.length === 0) {
     return "";
@@ -380,6 +399,11 @@ export function renderApprovalSection(approvals) {
     const verdict = entry.decision === "accept" ? "accepted" : "declined";
     const source = APPROVAL_SOURCE_LABELS[entry.source] ?? entry.source ?? "";
     lines.push(`- ${verdict}: ${entry.summary}${source ? ` (${source})` : ""}`);
+  }
+  // Declined without an answer from the user: the thread can be continued.
+  const unanswered = approvals.filter((entry) => UNANSWERED_APPROVAL_SOURCES.has(entry.source));
+  if (unanswered.length > 0) {
+    lines.push(formatApprovalResumeHint(unanswered.at(-1).summary));
   }
   return `${lines.join("\n")}\n`;
 }
@@ -555,6 +579,9 @@ export function renderCancelReport(job) {
   }
   if (job.summary) {
     lines.push(`- Summary: ${job.summary}`);
+  }
+  if (job.workerTerminationError) {
+    lines.push(`- The worker process could not be stopped (${job.workerTerminationError}); it ends when Codex finishes the interrupted turn, and the job stays cancelled.`);
   }
   lines.push("- Check `/codex:status` for the updated queue.");
 

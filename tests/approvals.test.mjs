@@ -12,7 +12,10 @@ import {
   buildApprovalResponse,
   buildApprovalRoutingParams,
   createApprovalHandler,
+  describeApprovalClosure,
   failClosedServerRequestResult,
+  formatClosedApprovalMessage,
+  normalizeApprovalTimeoutMinutes,
   listPendingApprovals,
   normalizeApprovalMode,
   recordApprovalDecision,
@@ -313,6 +316,11 @@ test("the approve command asks the user about each request and defaults to decli
   assert.match(source, /`codex:codex-approvals` skill/);
   assert.match(rules, /Decline \(Recommended\)/);
   assert.match(rules, /Approve once/);
+  // An expired or closed request is not a silent stop: offer --resume.
+  assert.match(rules, /already closed or expired[\s\S]*do not stop silently/);
+  assert.match(rules, /offer the user to continue the same Codex thread with that command/);
+  assert.match(rules, /\/codex:rescue --background --resume/);
+  assert.match(source, /`resumeHint`[\s\S]*\/codex:rescue --background --resume/);
   for (const text of [source, rules]) {
     assert.doesNotMatch(text, /acceptForSession|--decision accept\b(?!\|)/);
   }
@@ -712,7 +720,10 @@ test("the broker forwards approvals to the owning client only and declines when 
   const sessionDir = createBrokerSessionDir();
   const endpoint = createBrokerEndpoint(sessionDir);
   const broker = spawn(process.execPath, [BROKER, "serve", "--endpoint", endpoint, "--cwd", repo], { cwd: repo, env, stdio: "ignore" });
-  t.after(() => broker.kill());
+  t.after(() => {
+    broker.kill();
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  });
   assert.ok(await waitForBrokerEndpoint(endpoint, 10000), "broker did not start");
 
   const owner = await connectRaw(endpoint);
@@ -738,4 +749,115 @@ test("the broker forwards approvals to the owning client only and declines when 
   await waitFor(() => readFakeState(statePath).approvalResponses?.length === 1);
   assert.deepEqual(readFakeState(statePath).approvalResponses[0].result, { decision: "decline" });
   other.socket.destroy();
+});
+
+// --- closed and expired requests, approval timeout setting -------------------
+
+test("a closed request says when and how it was closed and how to continue the thread", () => {
+  const request = {
+    approvalId: "apr-0c",
+    jobId: "task-old",
+    summary: "Run npm test in /repo",
+    requestedAt: "2026-10-10T10:00:00.000Z",
+    expiresAt: "2026-10-10T10:15:00.000Z"
+  };
+  const timedOut = formatClosedApprovalMessage({
+    ...request,
+    outcome: { decision: "decline", source: "timeout", closedAt: "2026-10-10T10:15:00.400Z" }
+  });
+  assert.match(timedOut, /already closed \(decline, timeout\)/);
+  assert.match(timedOut, /nobody answered it within 15 minutes .*declined at 2026-10-10T10:15:00\.400Z/);
+  assert.match(timedOut, /\/codex:rescue --background --resume Retry: Run npm test in \/repo/);
+
+  const resolved = formatClosedApprovalMessage({
+    ...request,
+    outcome: { decision: "decline", source: "resolved-by-server", closedAt: "2026-10-10T10:01:00.000Z" }
+  });
+  assert.match(resolved, /Codex closed it itself at 2026-10-10T10:01:00\.000Z \(resolved-by-server\)/);
+  assert.match(resolved, /--resume/);
+
+  // The user's own answer needs no retry hint.
+  const answered = formatClosedApprovalMessage({
+    ...request,
+    outcome: { decision: "accept", source: "user", closedAt: "2026-10-10T10:02:00.000Z" }
+  });
+  assert.match(answered, /already closed \(accept, user\): the user already answered it at 2026-10-10T10:02:00\.000Z: accept/);
+  assert.doesNotMatch(answered, /--resume/);
+
+  // A request the job never closed (the worker was killed) ended with the job.
+  const ended = describeApprovalClosure(request, { id: "task-old", status: "cancelled", completedAt: "2026-10-10T10:05:00.000Z" });
+  assert.equal(ended.source, "job-ended");
+  assert.equal(ended.resumable, true);
+  assert.equal(describeApprovalClosure(request, { id: "task-old", status: "running" }), null);
+});
+
+test("approve on a finished job explains the expired request and suggests --resume", async () => {
+  const { repo, env } = setupRepo("approval-command");
+  const timedEnv = { ...env, CODEX_COMPANION_APPROVAL_TIMEOUT_MS: "2000" };
+  const jobId = launchBackgroundTask(repo, timedEnv, ["install a dependency"]);
+  const pending = await waitForPending(repo, timedEnv, jobId);
+  assert.equal(waitForJob(repo, timedEnv, jobId).status, "completed");
+
+  const late = run("node", [SCRIPT, "approve", jobId, pending[0].approvalId, "--decision", "accept"], { cwd: repo, env: timedEnv });
+  assert.notEqual(late.status, 0);
+  assert.match(late.stderr, /completed; it has no open approvals/);
+  assert.match(late.stderr, new RegExp(`${pending[0].approvalId} \\(Run npm install left-pad .+\\) is already closed \\(decline, timeout\\)`));
+  assert.match(late.stderr, /nobody answered it within 2 seconds .*so it was declined at \d{4}-\d\d-\d\dT/);
+  assert.match(late.stderr, /\/codex:rescue --background --resume Retry: Run npm install left-pad/);
+
+  const listed = run("node", [SCRIPT, "approvals", jobId, "--json"], { cwd: repo, env: timedEnv });
+  assert.equal(listed.status, 0, listed.stderr);
+  const payload = JSON.parse(listed.stdout);
+  assert.deepEqual(payload.pending, []);
+  assert.equal(payload.job.status, "completed");
+  assert.equal(payload.closed[0].approvalId, pending[0].approvalId);
+  assert.equal(payload.closed[0].source, "timeout");
+  assert.match(payload.resumeHint, /\/codex:rescue --background --resume Retry: Run npm install left-pad/);
+
+  const result = run("node", [SCRIPT, "result", jobId], { cwd: repo, env: timedEnv });
+  assert.match(result.stdout, /\(no answer before the timeout\)\nTo continue the Codex thread and retry, run: \/codex:rescue --background --resume/);
+});
+
+test("setup --approval-timeout sets the wait in the per-user config; the env variable still wins", async () => {
+  assert.equal(normalizeApprovalTimeoutMinutes("40"), 40);
+  for (const junk of ["0", "-5", "1.5", "abc", "1441"]) {
+    assert.throws(() => normalizeApprovalTimeoutMinutes(junk), /Unsupported approval timeout/);
+  }
+
+  const { repo, binDir, env } = setupRepo("approval-command");
+  const configFile = path.join(binDir, "codex-companion-config.json");
+  const defaults = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env }).stdout);
+  assert.deepEqual(
+    { minutes: defaults.approvalTimeout.minutes, source: defaults.approvalTimeout.source },
+    { minutes: 15, source: "default" }
+  );
+
+  const rejected = run("node", [SCRIPT, "setup", "--approval-timeout", "0"], { cwd: repo, env });
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Unsupported approval timeout "0"/);
+
+  const set = run("node", [SCRIPT, "setup", "--approval-timeout", "1", "--default-approvals", "ask"], { cwd: repo, env });
+  assert.equal(set.status, 0, set.stderr);
+  assert.match(set.stdout, /approval timeout: 1 minute \(plugin setting from /);
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "ask", approvalTimeoutMinutes: 1 });
+
+  const overridden = JSON.parse(
+    run("node", [SCRIPT, "setup", "--json"], { cwd: repo, env: { ...env, CODEX_COMPANION_APPROVAL_TIMEOUT_MS: "120000" } }).stdout
+  );
+  assert.deepEqual(
+    { minutes: overridden.approvalTimeout.minutes, source: overridden.approvalTimeout.source },
+    { minutes: 2, source: "env" }
+  );
+
+  // A background job waits as long as the setting says.
+  const jobId = launchBackgroundTask(repo, env, ["install a dependency"]);
+  const pending = await waitForPending(repo, env, jobId);
+  assert.equal(Date.parse(pending[0].expiresAt) - Date.parse(pending[0].requestedAt), 60000);
+  run("node", [SCRIPT, "approve", jobId, pending[0].approvalId, "--decision", "decline"], { cwd: repo, env });
+  assert.equal(waitForJob(repo, env, jobId).status, "completed");
+
+  const unset = run("node", [SCRIPT, "setup", "--approval-timeout", "unset", "--json"], { cwd: repo, env });
+  assert.equal(unset.status, 0, unset.stderr);
+  assert.equal(JSON.parse(unset.stdout).approvalTimeout.source, "default");
+  assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "ask" });
 });

@@ -1802,6 +1802,87 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+function processAlive(pid) {
+  if (!Number.isFinite(pid)) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+test("a cancelled job stays cancelled when its worker outlives cancel and finishes the interrupted turn", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task-late-interrupt");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  t.after(() => {
+    run("node", [SESSION_HOOK, "SessionEnd"], {
+      cwd: repo,
+      env,
+      input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+    });
+  });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const stateFile = path.join(stateDir, "state.json");
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId && job.pid ? job : null;
+  }, { timeoutMs: 15000 });
+  const workerPid = runningJob.pid;
+
+  // Simulate a cancel that cannot kill the worker (taskkill under Git Bash
+  // before this fix): hide the worker pid from cancel.
+  const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  state.jobs = state.jobs.map((job) => (job.id === jobId ? { ...job, pid: null } : job));
+  fs.writeFileSync(stateFile, `${JSON.stringify(state, null, 2)}\n`);
+
+  const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancelResult.status, 0, cancelResult.stderr);
+  const cancelPayload = JSON.parse(cancelResult.stdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.turnInterrupted, true);
+  assert.equal(cancelPayload.workerTerminated, false);
+  assert.ok(processAlive(workerPid), "the worker should still be running after cancel");
+
+  // The worker receives the interrupted turn/completed after cancel wrote
+  // its record, writes its final record and exits.
+  await waitFor(() => !processAlive(workerPid), { timeoutMs: 15000 });
+
+  const finalState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  const finalJob = finalState.jobs.find((job) => job.id === jobId);
+  assert.equal(finalJob.status, "cancelled");
+  assert.equal(finalJob.phase, "cancelled");
+  assert.equal(finalJob.pid, null);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(stored.errorMessage, "Cancelled by user.");
+  assert.ok(stored.cancelledAt);
+});
+
+test("an interrupted turn is recorded as cancelled, not failed", async () => {
+  const { resolveCompletionStatus } = await import("../plugins/codex/scripts/lib/tracked-jobs.mjs");
+  assert.equal(resolveCompletionStatus({ exitStatus: 1, turnStatus: "interrupted" }), "cancelled");
+  assert.equal(resolveCompletionStatus({ exitStatus: 1, turnStatus: "failed" }), "failed");
+  assert.equal(resolveCompletionStatus({ exitStatus: 0, turnStatus: "completed" }), "completed");
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
@@ -2236,27 +2317,49 @@ test("status reports shared session runtime when a lazy broker is active", () =>
   assert.match(result.stdout, /Session runtime: shared session/);
 });
 
+// A `codex` that is on PATH but unusable (`--version` fails). It shadows a
+// real Codex on the developer's machine, so setup reports Codex unavailable
+// and never connects to anything.
+function installUnavailableCodex(binDir) {
+  fs.writeFileSync(path.join(binDir, "codex"), "#!/bin/sh\nexit 1\n", { encoding: "utf8", mode: 0o755 });
+  if (process.platform === "win32") {
+    fs.writeFileSync(path.join(binDir, "codex.cmd"), "@exit /b 1\r\n", "utf8");
+  }
+}
+
 test("setup and status honor --cwd when reading shared session runtime", () => {
   const targetWorkspace = makeTempDir();
   const invocationWorkspace = makeTempDir();
+  const binDir = makeTempDir();
+  installUnavailableCodex(binDir);
+  // The broker.json below points at nobody. With a usable Codex, setup's auth
+  // check would find that broker dead and forget it (as it should); this test
+  // is only about which workspace's broker.json is read.
+  const env = buildEnv(binDir);
 
   saveBrokerSession(targetWorkspace, {
     endpoint: "unix:/tmp/fake-broker.sock"
   });
 
   const status = run("node", [SCRIPT, "status", "--cwd", targetWorkspace], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(status.status, 0, status.stderr);
   assert.match(status.stdout, /Session runtime: shared session/);
 
   const setup = run("node", [SCRIPT, "setup", "--cwd", targetWorkspace, "--json"], {
-    cwd: invocationWorkspace
+    cwd: invocationWorkspace,
+    env
   });
   assert.equal(setup.status, 0, setup.stderr);
   const payload = JSON.parse(setup.stdout);
+  assert.equal(payload.codex.available, false, "the test must not reach a real Codex");
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+  // The invocation workspace has no broker.json of its own.
+  const invocationSetup = JSON.parse(run("node", [SCRIPT, "setup", "--json"], { cwd: invocationWorkspace, env }).stdout);
+  assert.equal(invocationSetup.sessionRuntime.mode, "direct");
 });
 
 // The arguments the companion passes to \`codex\` for the app-server on this

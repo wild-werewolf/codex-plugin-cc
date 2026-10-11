@@ -11,6 +11,7 @@ import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { failClosedServerRequestResult } from "./lib/approvals.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { BROKER_IDLE_ENV, clearBrokerSessionIfOwned, resolveBrokerIdleMs } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
 
@@ -56,14 +57,28 @@ function writePidFile(pidFile) {
   fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
 }
 
+function removeQuietly(remove) {
+  try {
+    remove();
+  } catch {
+    // Already removed, still open elsewhere (Windows) or not empty.
+  }
+}
+
+function log(message) {
+  process.stderr.write(`[${new Date().toISOString()}] ${message}\n`);
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--log-file <path>]"
+    );
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "log-file", "endpoint"]
   });
 
   if (!options.endpoint) {
@@ -74,6 +89,11 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const logFile = options["log-file"] ? path.resolve(options["log-file"]) : null;
+  const idle = resolveBrokerIdleMs(process.env);
+  if (idle.invalid !== undefined) {
+    log(`Ignoring ${BROKER_IDLE_ENV}=${JSON.stringify(idle.invalid)} (not a non-negative integer); using ${idle.idleMs} ms.`);
+  }
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
@@ -85,6 +105,22 @@ async function main() {
   // app-server request id. Ids are kept as-is: clients tell them apart from
   // their own responses because server requests carry a `method`.
   const forwardedServerRequests = new Map();
+  // Idle tracking: the broker exits after `idle.idleMs` without a connected
+  // client, an active request, an active turn stream or a forwarded server
+  // request (an approval the user has not answered yet counts as work). A
+  // connected client counts even while it sends nothing: a task sits between
+  // `initialize` and `thread/start` for as long as its process takes, and
+  // must not lose the broker midway (EPIPE, or a second broker for one task).
+  // The readiness probe closes its socket at once, so it does not keep the
+  // broker up. Connections, messages and disconnects restart the clock.
+  let lastActivityAt = Date.now();
+  let shuttingDown = false;
+  function touch() {
+    lastActivityAt = Date.now();
+  }
+  function isBusy() {
+    return Boolean(sockets.size > 0 || activeRequestSocket || activeStreamSocket || forwardedServerRequests.size > 0);
+  }
 
   function settleForwardedRequests(socket) {
     for (const [key, entry] of forwardedServerRequests) {
@@ -107,6 +143,7 @@ async function main() {
   }
 
   function routeNotification(message) {
+    touch();
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -125,17 +162,42 @@ async function main() {
   }
 
   async function shutdown(server) {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
+    // Stop accepting clients first, then make broker.json stop pointing here
+    // (only if it still does): the next client starts a new broker instead
+    // of connecting to one that is going away.
+    const closed = new Promise((resolve) => server.close(resolve));
+    removeQuietly(() => clearBrokerSessionIfOwned(cwd, endpoint));
     for (const socket of sockets) {
       socket.end();
     }
     await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
+    await closed;
+    if (listenTarget.kind === "unix") {
+      removeQuietly(() => fs.existsSync(listenTarget.path) && fs.unlinkSync(listenTarget.path));
     }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
+    if (pidFile) {
+      removeQuietly(() => fs.existsSync(pidFile) && fs.unlinkSync(pidFile));
     }
+    if (logFile) {
+      removeQuietly(() => fs.existsSync(logFile) && fs.unlinkSync(logFile));
+    }
+    if (pidFile) {
+      // The per-broker session directory; removed only once it is empty.
+      removeQuietly(() => fs.rmdirSync(path.dirname(pidFile)));
+    }
+  }
+
+  async function shutdownAndExit(server, reason) {
+    if (shuttingDown) {
+      return;
+    }
+    log(`Shutting down: ${reason}.`);
+    await shutdown(server);
+    process.exit(0);
   }
 
   appClient.setNotificationHandler(routeNotification);
@@ -163,11 +225,17 @@ async function main() {
   });
 
   const server = net.createServer((socket) => {
+    touch();
+    if (shuttingDown) {
+      socket.destroy();
+      return;
+    }
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
 
     socket.on("data", async (chunk) => {
+      touch();
       buffer += chunk;
       // Re-read the buffer on every pass: while this handler awaits a request,
       // another data event (e.g. the answer to a forwarded approval request)
@@ -208,8 +276,18 @@ async function main() {
 
         if (message.id !== undefined && message.method === "broker/shutdown") {
           send(socket, { id: message.id, result: {} });
-          await shutdown(server);
-          process.exit(0);
+          await shutdownAndExit(server, "broker/shutdown requested");
+          return;
+        }
+
+        if (shuttingDown) {
+          if (message.id !== undefined && !isResponseMessage(message)) {
+            send(socket, {
+              id: message.id,
+              error: buildJsonRpcError(-32000, "Shared Codex broker is shutting down.")
+            });
+          }
+          continue;
         }
 
         if (isResponseMessage(message)) {
@@ -264,6 +342,7 @@ async function main() {
 
         try {
           const result = await appClient.request(message.method, message.params ?? {});
+          touch();
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -290,23 +369,50 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      touch();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      touch();
     });
   });
 
-  process.on("SIGTERM", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGTERM", () => {
+    void shutdownAndExit(server, "SIGTERM");
   });
 
-  process.on("SIGINT", async () => {
-    await shutdown(server);
-    process.exit(0);
+  process.on("SIGINT", () => {
+    void shutdownAndExit(server, "SIGINT");
   });
+
+  // Without its app-server the broker cannot serve anyone: exit, so the next
+  // client starts a new broker instead of reusing this one.
+  void appClient.exitPromise.then(() => {
+    if (!shuttingDown) {
+      void shutdownAndExit(server, `codex app-server exited${appClient.exitError ? ` (${appClient.exitError.message})` : ""}`);
+    }
+  });
+
+  if (idle.idleMs > 0) {
+    const checkEveryMs = Math.max(20, Math.min(1000, Math.floor(idle.idleMs / 4)));
+    const idleTimer = setInterval(() => {
+      if (shuttingDown) {
+        return;
+      }
+      if (isBusy()) {
+        touch();
+        return;
+      }
+      if (Date.now() - lastActivityAt >= idle.idleMs) {
+        clearInterval(idleTimer);
+        void shutdownAndExit(server, `idle for ${idle.idleMs} ms`);
+      }
+    }, checkEveryMs);
+    // The listening server keeps the process alive; the timer must not.
+    idleTimer.unref();
+  }
 
   server.listen(listenTarget.path);
 }

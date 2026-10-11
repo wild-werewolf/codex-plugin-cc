@@ -1,6 +1,13 @@
 import { spawnSync } from "node:child_process";
+import path from "node:path";
 import process from "node:process";
 
+// On Windows runCommand goes through a shell by default: `codex` and `npm`
+// are .cmd shims, which spawn cannot start without one. That shell is often
+// Git Bash ($SHELL), and MSYS rewrites arguments that start with "/" into
+// POSIX paths ("/PID" becomes "C:/Program Files/Git/PID"). Real executables
+// whose arguments start with "/" or carry paths (taskkill, git, pwsh) are
+// started with `shell: false`.
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
@@ -50,9 +57,22 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
   return { available: true, detail: result.stdout.trim() || result.stderr.trim() || "ok" };
 }
 
-function looksLikeMissingProcessMessage(text) {
-  return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+/**
+ * taskkill.exe from %SystemRoot%\System32 when SystemRoot is known, so a
+ * PATH reordered by Git Bash or another tool cannot pick a different
+ * `taskkill`; otherwise the bare name, found through PATH.
+ */
+export function resolveTaskkillCommand(env = process.env) {
+  const systemRoot = env?.SystemRoot || env?.SYSTEMROOT || env?.windir || env?.WINDIR;
+  return systemRoot ? path.win32.join(systemRoot, "System32", "taskkill.exe") : "taskkill.exe";
 }
+
+function looksLikeMissingProcessMessage(text) {
+  return /not found|no running instance|cannot find|does not exist|no such process|не найден/i.test(text);
+}
+
+// taskkill exits with 128 when no process has the given PID, in every locale.
+const TASKKILL_NOT_FOUND_STATUS = 128;
 
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
@@ -64,9 +84,12 @@ export function terminateProcessTree(pid, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    // taskkill.exe is a real executable: start it without a shell, so neither
+    // cmd nor Git Bash (MSYS path conversion) touches its "/PID" arguments.
+    const result = runCommandImpl(resolveTaskkillCommand(options.env ?? process.env), ["/PID", String(pid), "/T", "/F"], {
       cwd: options.cwd,
-      env: options.env
+      env: options.env,
+      shell: false
     });
 
     if (!result.error && result.status === 0) {
@@ -74,7 +97,7 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
+    if (!result.error && (result.status === TASKKILL_NOT_FOUND_STATUS || looksLikeMissingProcessMessage(combinedOutput))) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 

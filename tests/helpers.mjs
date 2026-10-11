@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { after } from "node:test";
 import { spawnSync } from "node:child_process";
+
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 // Isolate every test process from the developer's Claude Code session. Its
 // SessionStart hook exports CLAUDE_PLUGIN_DATA (and the session id and
@@ -28,8 +31,92 @@ for (const name of [
   delete process.env[name];
 }
 
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// Every temp dir made by makeTempDir in this process: tests that use their
+// own CLAUDE_PLUGIN_DATA keep it inside one of them.
+const createdTempDirs = new Set();
+
+function findBrokerFiles(root, depth, found) {
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name === "broker.json") {
+      found.push(path.join(root, entry.name));
+    } else if (entry.isDirectory() && depth > 0 && entry.name !== ".git" && entry.name !== "node_modules") {
+      findBrokerFiles(path.join(root, entry.name), depth - 1, found);
+    }
+  }
+  return found;
+}
+
+/**
+ * Stop every shared broker a test of this process started. Brokers record
+ * themselves in `<plugin data>/state/<workspace>/broker.json`; the plugin
+ * data dirs of this process are TEST_PLUGIN_DATA and dirs inside its temp
+ * dirs. SIGTERM lets a broker close its `codex app-server` and remove its
+ * files; a broker still alive after that is killed with its process tree.
+ */
+export async function stopTestBrokers() {
+  const brokerFiles = [TEST_PLUGIN_DATA, ...createdTempDirs].flatMap((root) => findBrokerFiles(root, 6, []));
+  const pids = [];
+  for (const brokerFile of new Set(brokerFiles)) {
+    let session = null;
+    try {
+      session = JSON.parse(fs.readFileSync(brokerFile, "utf8"));
+    } catch {
+      continue;
+    }
+    const pid = Number(session?.pid);
+    if (Number.isFinite(pid) && pid > 0 && processAlive(pid)) {
+      pids.push(pid);
+      try {
+        if (process.platform === "win32") {
+          terminateProcessTree(pid);
+        } else {
+          process.kill(pid, "SIGTERM");
+        }
+      } catch {
+        // Already gone.
+      }
+    }
+    fs.rmSync(brokerFile, { force: true });
+  }
+  const deadline = Date.now() + 5000;
+  while (pids.some(processAlive) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  for (const pid of pids.filter(processAlive)) {
+    try {
+      terminateProcessTree(pid);
+    } catch {
+      // Already gone.
+    }
+  }
+  return pids;
+}
+
+// After all tests of a test file. Only in test files: helpers are also
+// imported by fixture scripts, where a test hook would print TAP output.
+if (/\.test\.mjs$/.test(process.argv[1] ?? "")) {
+  after(stopTestBrokers);
+}
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  createdTempDirs.add(dir);
+  return dir;
 }
 
 export function writeExecutable(filePath, source) {
