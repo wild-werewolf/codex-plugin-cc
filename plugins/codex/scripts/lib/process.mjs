@@ -140,6 +140,39 @@ export function terminateProcessTree(pid, options = {}) {
   }
 }
 
+/**
+ * Whether a process with this pid exists. EPERM means it exists but belongs
+ * to someone else.
+ */
+export function isProcessAlive(pid, killImpl = process.kill.bind(process)) {
+  if (!Number.isFinite(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    killImpl(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+/**
+ * Wait up to `timeoutMs` for the process to exit. Resolves to true once it is
+ * gone, false when it is still running at the deadline.
+ */
+export async function waitForProcessExit(pid, timeoutMs, options = {}) {
+  const intervalMs = options.intervalMs ?? 50;
+  const isAlive = options.isAlive ?? ((candidate) => isProcessAlive(candidate));
+  const deadline = Date.now() + timeoutMs;
+  while (isAlive(pid)) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return true;
+}
+
 export function formatCommandFailure(result) {
   const parts = [`${result.command} ${result.args.join(" ")}`.trim()];
   if (result.signal) {

@@ -78,21 +78,162 @@ export async function sendBrokerShutdown(endpoint) {
   });
 }
 
-export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile, env = process.env }) {
+const BROKER_LAUNCHER_PATH = fileURLToPath(new URL("../broker-launcher.mjs", import.meta.url));
+const BROKER_LAUNCH_TIMEOUT_MS = 15000;
+
+/**
+ * How the broker is started. "launcher" (Windows): through broker-launcher.mjs,
+ * which starts the broker and exits, so the broker's ParentProcessId names a
+ * dead process and `taskkill /PID <client> /T` (cancel of the task worker that
+ * happened to start it) cannot reach the shared broker. "direct" (POSIX): a
+ * detached child; it gets its own session and process group, and signals to
+ * the client's group (cancel kills `-pid`) do not reach it.
+ */
+export function resolveBrokerLaunchMode(platform = process.platform) {
+  return platform === "win32" ? "launcher" : "direct";
+}
+
+function spawnBrokerDirect({ args, cwd, logFile, env }) {
   const logFd = fs.openSync(logFile, "a");
-  const child = spawn(
-    process.execPath,
-    [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--log-file", logFile],
-    {
+  const child = spawn(process.execPath, args, {
+    cwd,
+    env,
+    detached: true,
+    stdio: ["ignore", logFd, logFd],
+    windowsHide: true
+  });
+  child.unref();
+  fs.closeSync(logFd);
+  return { pid: child.pid ?? null, mode: "direct" };
+}
+
+function parseLauncherPid(stdout) {
+  for (const line of stdout.split(/\r?\n/).reverse()) {
+    try {
+      const pid = JSON.parse(line)?.pid;
+      if (Number.isInteger(pid)) {
+        return pid;
+      }
+    } catch {
+      // Not the launcher's JSON line.
+    }
+  }
+  return null;
+}
+
+function spawnBrokerThroughLauncher({ args, cwd, logFile, env, launcherPath }) {
+  return new Promise((resolve, reject) => {
+    const launcher = spawn(process.execPath, [launcherPath, logFile, ...args], {
       cwd,
       env,
       detached: true,
-      stdio: ["ignore", logFd, logFd]
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    let exitInfo = null;
+    let graceTimer = null;
+    launcher.stdout.setEncoding("utf8");
+    launcher.stderr.setEncoding("utf8");
+    launcher.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    launcher.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+
+    function settle(error, value) {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(graceTimer);
+      // The broker may hold an inherited copy of the launcher's pipes
+      // (Windows handle inheritance): stop reading, or they would keep this
+      // client's event loop alive for as long as the broker runs.
+      launcher.stdout.destroy();
+      launcher.stderr.destroy();
+      launcher.unref();
+      if (error) {
+        reject(error);
+      } else {
+        resolve(value);
+      }
     }
-  );
-  child.unref();
-  fs.closeSync(logFd);
-  return child;
+
+    function finish() {
+      const { code, signal } = exitInfo;
+      if (code === 0) {
+        // `pid` is null only when the launcher's line has not arrived; the
+        // broker writes its own pid file, which the caller reads instead.
+        settle(null, { pid: parseLauncherPid(stdout), mode: "launcher" });
+        return;
+      }
+      const detail = stderr.trim() || stdout.trim() || (signal ? `signal ${signal}` : `exit ${code}`);
+      settle(new Error(`Could not start the shared Codex broker: ${detail}`));
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        launcher.kill();
+      } catch {
+        // Already gone.
+      }
+      settle(new Error(`The broker launcher did not finish within ${BROKER_LAUNCH_TIMEOUT_MS} ms.`));
+    }, BROKER_LAUNCH_TIMEOUT_MS);
+    launcher.on("error", (error) => settle(error));
+    // "exit" comes as soon as the launcher is gone; "close" also waits for
+    // its pipes, which never close while the broker holds a copy of them.
+    // Take whatever output arrived within a short grace period.
+    launcher.on("exit", (code, signal) => {
+      exitInfo = { code, signal };
+      if (parseLauncherPid(stdout) !== null) {
+        finish();
+        return;
+      }
+      graceTimer = setTimeout(finish, 500);
+    });
+    launcher.on("close", () => {
+      if (exitInfo) {
+        finish();
+      }
+    });
+  });
+}
+
+function readBrokerPidFile(pidFile) {
+  try {
+    const pid = Number(fs.readFileSync(pidFile, "utf8").trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Start the shared broker outside the calling client's process tree.
+ * Resolves to `{ pid, mode }`, where `pid` is the broker's own pid (the one
+ * recorded in broker.json), never the launcher's; null only when the
+ * launcher's report did not arrive, and then the broker's pid file has it.
+ */
+export async function spawnBrokerProcess({
+  scriptPath,
+  cwd,
+  endpoint,
+  pidFile,
+  logFile,
+  env = process.env,
+  mode = resolveBrokerLaunchMode(),
+  launcherPath = BROKER_LAUNCHER_PATH
+}) {
+  const args = [scriptPath, "serve", "--endpoint", endpoint, "--cwd", cwd, "--pid-file", pidFile, "--log-file", logFile];
+  if (mode === "launcher") {
+    return spawnBrokerThroughLauncher({ args, cwd, logFile, env, launcherPath });
+  }
+  return spawnBrokerDirect({ args, cwd, logFile, env });
 }
 
 function resolveBrokerStateFile(cwd) {
@@ -208,14 +349,21 @@ export async function ensureBrokerSession(cwd, options = {}) {
     options.scriptPath ??
     fileURLToPath(new URL("../app-server-broker.mjs", import.meta.url));
 
-  const child = spawnBrokerProcess({
-    scriptPath,
-    cwd,
-    endpoint,
-    pidFile,
-    logFile,
-    env: options.env ?? process.env
-  });
+  let broker;
+  try {
+    broker = await spawnBrokerProcess({
+      scriptPath,
+      cwd,
+      endpoint,
+      pidFile,
+      logFile,
+      env: options.env ?? process.env,
+      ...(options.brokerLaunchMode ? { mode: options.brokerLaunchMode } : {})
+    });
+  } catch {
+    teardownBrokerSession({ endpoint, pidFile, logFile, sessionDir, pid: null });
+    return null;
+  }
 
   const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
   if (!ready) {
@@ -224,7 +372,7 @@ export async function ensureBrokerSession(cwd, options = {}) {
       pidFile,
       logFile,
       sessionDir,
-      pid: child.pid ?? null,
+      pid: broker.pid ?? null,
       killProcess: options.killProcess ?? null
     });
     return null;
@@ -235,7 +383,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    // The broker writes its pid file before it listens on its endpoint.
+    pid: broker.pid ?? readBrokerPidFile(pidFile)
   };
   saveBrokerSession(cwd, session);
   return session;
