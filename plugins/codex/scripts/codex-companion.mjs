@@ -48,7 +48,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, terminateProcessTree, waitForProcessExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -99,6 +99,9 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const DEFAULT_WATCH_TIMEOUT_MS = 25 * 60 * 1000;
 const DEFAULT_WATCH_POLL_INTERVAL_MS = 1000;
 const FINISHED_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
+// How long `cancel` lets a worker exit on its own after its turn was
+// interrupted before it kills the worker's process tree.
+const CANCEL_WORKER_EXIT_GRACE_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -1301,17 +1304,14 @@ async function handleCancel(argv) {
     );
   }
 
-  // A worker that cannot be killed still ends once its turn is interrupted;
-  // it keeps the cancelled status recorded below (see runTrackedJob).
-  let termination;
-  try {
-    termination = terminateProcessTree(job.pid ?? Number.NaN);
-  } catch (error) {
-    termination = { attempted: true, delivered: false, error: error instanceof Error ? error.message : String(error) };
-    appendLogLine(job.logFile, `Could not stop the worker process ${job.pid}: ${termination.error}`);
+  const worker = await stopCancelledWorker(job, interrupt);
+  if (worker.logLine) {
+    appendLogLine(job.logFile, worker.logLine);
   }
   appendLogLine(job.logFile, "Cancelled by user.");
 
+  // Read the record again: a worker that exited on its own has just written
+  // its final record (with the partial result); keep it, marked cancelled.
   const completedAt = nowIso();
   const nextJob = {
     ...job,
@@ -1321,9 +1321,8 @@ async function handleCancel(argv) {
     completedAt,
     errorMessage: "Cancelled by user."
   };
-
   writeJobFile(workspaceRoot, job.id, {
-    ...existing,
+    ...(readStoredJob(workspaceRoot, job.id) ?? existing),
     ...nextJob,
     cancelledAt: completedAt
   });
@@ -1342,15 +1341,52 @@ async function handleCancel(argv) {
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted,
-    workerTerminated: Boolean(termination.delivered),
-    ...(termination.error ? { workerTerminationError: termination.error } : {})
+    workerStop: worker.outcome,
+    workerExited: worker.outcome === "exited",
+    workerTerminated: worker.outcome === "terminated",
+    ...(worker.error ? { workerTerminationError: worker.error } : {})
   };
 
   outputCommandResult(
     payload,
-    renderCancelReport({ ...nextJob, workerTerminationError: termination.error ?? null }),
+    renderCancelReport({
+      ...nextJob,
+      turnInterrupted: interrupt.interrupted,
+      workerStop: worker.outcome,
+      workerTerminationError: worker.error ?? null
+    }),
     options.json
   );
+}
+
+/**
+ * Stop the worker of a cancelled job. After a successful turn interrupt the
+ * worker normally finishes on its own (it records the interrupted turn and
+ * exits), so give it CANCEL_WORKER_EXIT_GRACE_MS before killing its tree.
+ *
+ * outcome: "exited" (it ended without being killed, including a kill that
+ * found no such process), "terminated" (cancel killed it), "failed" (it could
+ * not be killed; it still ends once its turn is over, and the job stays
+ * cancelled), or null (the job has no worker pid).
+ */
+async function stopCancelledWorker(job, interrupt) {
+  const pid = job.pid ?? Number.NaN;
+  if (!Number.isFinite(pid)) {
+    return { outcome: null };
+  }
+  if (interrupt.interrupted && (await waitForProcessExit(pid, CANCEL_WORKER_EXIT_GRACE_MS))) {
+    return { outcome: "exited", logLine: `The worker process ${pid} exited after the turn interrupt.` };
+  }
+  try {
+    const termination = terminateProcessTree(pid);
+    if (termination.delivered) {
+      return { outcome: "terminated", logLine: `Stopped the worker process ${pid}.` };
+    }
+    return { outcome: "exited", logLine: `The worker process ${pid} had already exited.` };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { outcome: "failed", error: message, logLine: `Could not stop the worker process ${pid}: ${message}` };
+  }
 }
 
 async function main() {

@@ -1614,7 +1614,11 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   });
 
   assert.equal(cancelResult.status, 0, cancelResult.stderr);
-  assert.equal(JSON.parse(cancelResult.stdout).status, "cancelled");
+  const cancelPayload = JSON.parse(cancelResult.stdout);
+  assert.equal(cancelPayload.status, "cancelled");
+  assert.equal(cancelPayload.workerStop, "terminated");
+  assert.equal(cancelPayload.workerTerminated, true);
+  assert.equal(cancelPayload.workerExited, false);
 
   await waitFor(() => {
     try {
@@ -1633,6 +1637,61 @@ test("cancel stops an active background job and marks it cancelled", async (t) =
   const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
   assert.equal(stored.status, "cancelled");
   assert.match(fs.readFileSync(logFile, "utf8"), /Cancelled by user/);
+});
+
+test("cancel of a job whose worker already exited is not an error and says so", async () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+
+  // A real pid that no longer runs (taskkill exits with 128 for it on Windows).
+  const gone = spawn(process.execPath, ["-e", ""], { stdio: "ignore", windowsHide: true });
+  await new Promise((resolve) => gone.on("exit", resolve));
+  assert.equal(processAlive(gone.pid), false);
+
+  function writeJob(id) {
+    const logFile = path.join(jobsDir, `${id}.log`);
+    fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+    fs.writeFileSync(path.join(jobsDir, `${id}.json`), JSON.stringify({ id, status: "running", title: "Codex Task", logFile }), "utf8");
+    return {
+      id,
+      status: "running",
+      title: "Codex Task",
+      jobClass: "task",
+      pid: gone.pid,
+      logFile,
+      createdAt: "2026-03-18T15:30:00.000Z",
+      updatedAt: "2026-03-18T15:30:02.000Z"
+    };
+  }
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [writeJob("task-gone"), writeJob("task-gone-text")] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  const json = run("node", [SCRIPT, "cancel", "task-gone", "--json"], { cwd: workspace });
+  assert.equal(json.status, 0, json.stderr);
+  const payload = JSON.parse(json.stdout);
+  assert.equal(payload.status, "cancelled");
+  assert.equal(payload.workerStop, "exited");
+  assert.equal(payload.workerExited, true);
+  assert.equal(payload.workerTerminated, false);
+  assert.equal(payload.workerTerminationError, undefined);
+  assert.match(fs.readFileSync(path.join(jobsDir, "task-gone.log"), "utf8"), new RegExp(`worker process ${gone.pid} had already exited`));
+
+  const text = run("node", [SCRIPT, "cancel", "task-gone-text"], { cwd: workspace });
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /Cancelled task-gone-text\./);
+  assert.match(text.stdout, /The worker process had already exited\./);
+  assert.doesNotMatch(text.stdout, /could not be stopped/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  for (const job of state.jobs) {
+    assert.equal(job.status, "cancelled");
+    assert.equal(job.pid, null);
+  }
 });
 
 test("cancel without a job id ignores active jobs from other Claude sessions", () => {
@@ -1779,6 +1838,12 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cancelPayload.status, "cancelled");
   assert.equal(cancelPayload.turnInterruptAttempted, true);
   assert.equal(cancelPayload.turnInterrupted, true);
+  // The interrupted turn ends at once: the worker exits on its own within
+  // cancel's grace period and is not killed.
+  assert.equal(cancelPayload.workerStop, "exited");
+  assert.equal(cancelPayload.workerExited, true);
+  assert.equal(cancelPayload.workerTerminated, false);
+  assert.equal(cancelPayload.workerTerminationError, undefined);
 
   await waitFor(() => {
     const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));

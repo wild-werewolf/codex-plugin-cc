@@ -13,13 +13,16 @@ import {
   buildApprovalRoutingParams,
   createApprovalHandler,
   describeApprovalClosure,
+  describeApprovalRequest,
   failClosedServerRequestResult,
+  formatApprovalCommandForDisplay,
   formatClosedApprovalMessage,
   normalizeApprovalTimeoutMinutes,
   listPendingApprovals,
   normalizeApprovalMode,
   recordApprovalDecision,
-  resolveApprovalsDir
+  resolveApprovalsDir,
+  splitPosixShellWords
 } from "../plugins/codex/scripts/lib/approvals.mjs";
 import {
   assertThreadPermissions,
@@ -860,4 +863,55 @@ test("setup --approval-timeout sets the wait in the per-user config; the env var
   assert.equal(unset.status, 0, unset.stderr);
   assert.equal(JSON.parse(unset.stdout).approvalTimeout.source, "default");
   assert.deepEqual(JSON.parse(fs.readFileSync(configFile, "utf8")), { defaultApprovals: "ask" });
+});
+
+// Codex joins the argv of a command approval with POSIX shell quoting (the
+// Rust shlex crate): a backslash is not allowed in single quotes, so every
+// Windows path that needs quoting lands in double quotes with each backslash
+// doubled. These strings are what Codex sends for such argvs.
+const PWSH_ARGV = [
+  "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+  "-NoProfile",
+  "-Command",
+  "Get-ChildItem 'C:\\Users\\me\\proj'"
+];
+const PWSH_QUOTED =
+  '"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe" -NoProfile -Command "Get-ChildItem \'C:\\\\Users\\\\me\\\\proj\'"';
+
+test("splitPosixShellWords undoes shlex quoting, mixed quotes included", () => {
+  assert.deepEqual(splitPosixShellWords(PWSH_QUOTED), PWSH_ARGV);
+  assert.deepEqual(splitPosixShellWords(`"Get-Content "'$env:USERPROFILE'"\\\\notes.txt"`), ["Get-Content $env:USERPROFILE\\notes.txt"]);
+  assert.deepEqual(splitPosixShellWords(`echo 'a b' "c\\"d" e\\ f ''`), ["echo", "a b", 'c"d', "e f", ""]);
+  assert.equal(splitPosixShellWords(`echo "unterminated`), null);
+  assert.equal(splitPosixShellWords(`echo 'unterminated`), null);
+});
+
+test("on Windows a command approval shows the command with single backslashes", () => {
+  assert.equal(
+    formatApprovalCommandForDisplay(PWSH_QUOTED, "win32"),
+    `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -Command "Get-ChildItem 'C:\\Users\\me\\proj'"`
+  );
+  assert.equal(formatApprovalCommandForDisplay('"C:\\\\Users\\\\me\\\\a.txt"', "win32"), "C:\\Users\\me\\a.txt");
+  // Not shell-quoted the way Codex quotes: shown as sent.
+  assert.equal(formatApprovalCommandForDisplay(`echo "unterminated`, "win32"), `echo "unterminated`);
+  // Elsewhere the POSIX form is what the shell runs: unchanged.
+  assert.equal(formatApprovalCommandForDisplay(PWSH_QUOTED, "linux"), PWSH_QUOTED);
+
+  const description = describeApprovalRequest(
+    "item/commandExecution/requestApproval",
+    { command: PWSH_QUOTED, cwd: "C:\\Users\\me\\proj", reason: "needs the home directory" },
+    { platform: "win32" }
+  );
+  assert.equal(
+    description.summary,
+    `Run "C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -Command "Get-ChildItem 'C:\\Users\\me\\proj'" in C:\\Users\\me\\proj`
+  );
+  assert.doesNotMatch(description.summary, /\\\\/);
+  assert.equal(description.command, formatApprovalCommandForDisplay(PWSH_QUOTED, "win32"));
+  assert.equal(description.quotedCommand, PWSH_QUOTED);
+
+  const posix = describeApprovalRequest("item/commandExecution/requestApproval", { command: "npm test", cwd: "/repo" }, { platform: "linux" });
+  assert.equal(posix.summary, "Run npm test in /repo");
+  assert.equal(posix.command, "npm test");
+  assert.equal("quotedCommand" in posix, false);
 });

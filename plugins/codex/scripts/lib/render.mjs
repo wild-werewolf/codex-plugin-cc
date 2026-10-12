@@ -580,6 +580,19 @@ export function renderCancelReport(job) {
   if (job.summary) {
     lines.push(`- Summary: ${job.summary}`);
   }
+  if (job.workerStop === "exited") {
+    lines.push(
+      job.turnInterrupted
+        ? "- The worker process exited on its own after the Codex turn was interrupted."
+        : "- The worker process had already exited."
+    );
+  } else if (job.workerStop === "terminated") {
+    lines.push(
+      job.turnInterrupted
+        ? "- The worker process did not exit after the Codex turn was interrupted and was stopped."
+        : "- The worker process was stopped."
+    );
+  }
   if (job.workerTerminationError) {
     lines.push(`- The worker process could not be stopped (${job.workerTerminationError}); it ends when Codex finishes the interrupted turn, and the job stays cancelled.`);
   }

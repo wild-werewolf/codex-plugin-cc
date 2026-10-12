@@ -9,6 +9,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import process from "node:process";
 
 import { readUserConfig, resolveJobsDir } from "./state.mjs";
 
@@ -188,14 +189,105 @@ function formatPermissions(permissions) {
   return parts.join("; ") || "unspecified permissions";
 }
 
-export function describeApprovalRequest(method, params = {}) {
+/**
+ * Split a string quoted by POSIX shell rules into its words; null when it is
+ * not well formed (an unterminated quote or a trailing backslash).
+ */
+export function splitPosixShellWords(text) {
+  const words = [];
+  let word = null;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (/\s/.test(char)) {
+      if (word !== null) {
+        words.push(word);
+        word = null;
+      }
+      continue;
+    }
+    word ??= "";
+    if (char === "'") {
+      const end = text.indexOf("'", index + 1);
+      if (end === -1) {
+        return null;
+      }
+      word += text.slice(index + 1, end);
+      index = end;
+    } else if (char === '"') {
+      index += 1;
+      for (; index < text.length && text[index] !== '"'; index += 1) {
+        if (text[index] === "\\" && index + 1 < text.length && '$`"\\\n'.includes(text[index + 1])) {
+          index += 1;
+          if (text[index] === "\n") {
+            continue;
+          }
+        }
+        word += text[index];
+      }
+      if (index >= text.length) {
+        return null;
+      }
+    } else if (char === "\\") {
+      if (index + 1 >= text.length) {
+        return null;
+      }
+      index += 1;
+      if (text[index] !== "\n") {
+        word += text[index];
+      }
+    } else {
+      word += char;
+    }
+  }
+  if (word !== null) {
+    words.push(word);
+  }
+  return words;
+}
+
+function quoteWindowsDisplayWord(word) {
+  if (word !== "" && !/[\s"']/.test(word)) {
+    return word;
+  }
+  if (!word.includes('"')) {
+    return `"${word}"`;
+  }
+  if (!word.includes("'")) {
+    return `'${word}'`;
+  }
+  return `"${word.replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * The command of a commandExecution approval request as the user should see
+ * it. Codex sends the command's argv joined with POSIX shell quoting
+ * (shlex_join): on Windows a word with a quote in it lands in double quotes
+ * with every backslash doubled ("Get-Content 'C:\\Users\\me'"). On Windows
+ * the words are recovered and shown with Windows quoting and single
+ * backslashes; elsewhere the POSIX form is what a shell runs, so it stays.
+ */
+export function formatApprovalCommandForDisplay(command, platform = process.platform) {
+  if (typeof command !== "string" || platform !== "win32") {
+    return command;
+  }
+  const words = splitPosixShellWords(command);
+  if (!words || words.length === 0) {
+    return command;
+  }
+  return words.map(quoteWindowsDisplayWord).join(" ");
+}
+
+export function describeApprovalRequest(method, params = {}, options = {}) {
   switch (method) {
     case "item/commandExecution/requestApproval": {
-      const command = params.command ?? (params.kind === "writeStdin" ? "input to a running command" : "a command");
+      const shown =
+        typeof params.command === "string" ? formatApprovalCommandForDisplay(params.command, options.platform) : null;
+      const command = shown ?? (params.kind === "writeStdin" ? "input to a running command" : "a command");
       return {
         kind: params.kind === "writeStdin" ? "stdin" : "command",
         summary: `Run ${command}${params.cwd ? ` in ${params.cwd}` : ""}`,
-        command: params.command ?? null,
+        command: shown ?? params.command ?? null,
+        ...(shown !== null && shown !== params.command ? { quotedCommand: params.command } : {}),
         cwd: params.cwd ?? null,
         reason: params.reason ?? null
       };
@@ -569,7 +661,7 @@ export function createApprovalHandler(options = {}) {
       return failClosedServerRequestResult(message);
     }
 
-    const description = describeApprovalRequest(message.method, message.params);
+    const description = describeApprovalRequest(message.method, message.params, { platform: options.platform });
     if (mode === "deny" || !interactive || handle.closed) {
       const why = mode === "deny" ? "approval mode is deny" : handle.closed ? "the run is finishing" : nonInteractiveReason;
       const source = mode === "deny" ? "deny-mode" : handle.closed ? "closed" : nonInteractiveSource;
