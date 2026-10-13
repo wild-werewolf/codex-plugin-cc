@@ -247,11 +247,18 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /\/codex:setup --disable-review-gate/);
 });
 
-test("rescue forwards --name to task as a runtime flag and never invents one", () => {
+test("rescue keeps a user --name and otherwise lets the subagent name a fresh thread", () => {
   const rescue = read("commands/rescue.md");
   const agent = read("agents/codex-rescue.md");
+  const runtime = read("skills/codex-cli-runtime/SKILL.md");
   assert.match(rescue, /argument-hint:.*\[--name <thread name>\]/);
-  assert.match(rescue, /`--name <thread name>` names the Codex thread/);
-  assert.match(rescue, /keep it out of the task text, and never add or change it yourself/);
-  assert.match(agent, /Treat `--name <thread name>` as a runtime control/);
+  assert.match(rescue, /the user's name always wins/);
+  assert.match(rescue, /When the user gave none, do not add one here: the subagent names a fresh thread itself/);
+  for (const text of [agent, runtime]) {
+    assert.match(text, /If the user gave no `--name` and this is a fresh run \(no `--resume-last`\), add `--name "<short name>"` yourself/);
+    assert.match(text, /2 to 6 words .* in the language of the user's request/);
+    assert.match(text, /On `--resume-last` add no name/);
+  }
+  assert.match(agent, /when the user gave it, forward it to `task` unchanged \(quote the value\), never change it/);
+  assert.match(runtime, /If the forwarded request includes `--name <thread name>`, pass it through to `task` unchanged/);
 });

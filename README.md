@@ -189,7 +189,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- the Codex thread is named `<prefix>: <name>` with `--name <name>`, otherwise `<prefix>: <start of the task text>`; the prefix is `CCT` unless you change it (see [Thread name prefix](#thread-name-prefix)). `--resume` keeps the thread's name unless you pass `--name` too. `/codex:status` and `/codex:result` show the name as `Codex thread:`.
+- the Codex thread is named `<prefix>: <name>`. Give the name with `--name <name>`; without it, Claude picks a short name (2 to 6 words, in the language of your request) for a new thread, and a run without any name (calling `task` directly) uses `<prefix>: <start of the task text>`; the prefix is `CCT` unless you change it (see [Thread name prefix](#thread-name-prefix)). `--resume` keeps the thread's name unless you pass `--name` too. `/codex:status` and `/codex:result` show the name as `Codex thread:`.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--write` selects `workspace-write`, otherwise the run is `read-only`. The plugin never asks for full access.

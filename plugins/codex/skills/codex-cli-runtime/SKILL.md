@@ -31,6 +31,8 @@ Command selection:
 - If the forwarded request includes `--model`, normalize `spark` to `gpt-5.3-codex-spark` and pass it through to `task`.
 - If the forwarded request includes `--effort`, pass it through to `task`.
 - If the forwarded request includes `--approvals <ask|auto-review|deny>`, pass it through to `task` unchanged. Never add it on your own.
+- If the forwarded request includes `--name <thread name>`, pass it through to `task` unchanged (quoted) and keep it out of the task text.
+- If the user gave no `--name` and this is a fresh run (no `--resume-last`), add `--name "<short name>"` yourself: 2 to 6 words that say what the task is about, in the language of the user's request, without quotes, a prefix such as `CCT`, a job id or a trailing period (for example `--name "Fix cancel on Windows"`). The companion shows it in Codex as `<prefix>: <name>`. On `--resume-last` add no name: the resumed thread keeps its own unless the user gave `--name`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `task --resume-last`, even if the request text is ambiguous.
