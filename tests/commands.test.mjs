@@ -233,9 +233,11 @@ test("setup command can offer Codex install and still points users to codex logi
 
   assert.match(
     setup,
-    /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--default-approvals ask\|auto-review\|deny\|unset\] \[--approval-timeout <minutes>\|unset\]'/
+    /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--default-approvals ask\|auto-review\|deny\|unset\] \[--approval-timeout <minutes>\|unset\] \[--thread-prefix <text>\|unset\]'/
   );
   assert.match(setup, /`approvalTimeout`/);
+  assert.match(setup, /`threadPrefix`/);
+  assert.match(setup, /CODEX_COMPANION_THREAD_PREFIX/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
@@ -243,4 +245,13 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("rescue forwards --name to task as a runtime flag and never invents one", () => {
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  assert.match(rescue, /argument-hint:.*\[--name <thread name>\]/);
+  assert.match(rescue, /`--name <thread name>` names the Codex thread/);
+  assert.match(rescue, /keep it out of the task text, and never add or change it yourself/);
+  assert.match(agent, /Treat `--name <thread name>` as a runtime control/);
 });

@@ -196,7 +196,7 @@ export const USER_CONFIG_FILE_ENV = "CODEX_COMPANION_CONFIG_FILE";
 // Settings this plugin keeps in the per-user file. Only these are taken from
 // old or sibling `config.json` files: a `codex-*` data directory may belong
 // to another plugin, whose keys must never be read or copied.
-export const USER_CONFIG_KEYS = Object.freeze(["defaultApprovals", "approvalTimeoutMinutes"]);
+export const USER_CONFIG_KEYS = Object.freeze(["defaultApprovals", "approvalTimeoutMinutes", "threadPrefix"]);
 const USER_CONFIG_DIR_NAME = "codex-companion";
 const USER_CONFIG_FILE_NAME = "config.json";
 

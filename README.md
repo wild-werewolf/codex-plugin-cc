@@ -166,7 +166,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--fresh`, and `--name`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
 
 Examples:
 
@@ -177,6 +177,7 @@ Examples:
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
+/codex:rescue --background --name "Flaky login test" investigate the regression
 ```
 
 You can also just ask for a task to be delegated to Codex:
@@ -188,6 +189,7 @@ Ask Codex to redesign the database connection to be more resilient.
 **Notes:**
 
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
+- the Codex thread is named `<prefix>: <name>` with `--name <name>`, otherwise `<prefix>: <start of the task text>`; the prefix is `CCT` unless you change it (see [Thread name prefix](#thread-name-prefix)). `--resume` keeps the thread's name unless you pass `--name` too. `/codex:status` and `/codex:result` show the name as `Codex thread:`.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
 - `--write` selects `workspace-write`, otherwise the run is `read-only`. The plugin never asks for full access.
@@ -332,6 +334,15 @@ The setting is stored once per user, outside the plugin's data directory, so it 
 ```
 
 Sets how many minutes (1 to 1440) a background job waits for your answer to an approval request before it declines it; the default is 15. It is stored in the same per-user `config.json` as the default approval mode (`approvalTimeoutMinutes`). `CODEX_COMPANION_APPROVAL_TIMEOUT_MS`, when set, still takes precedence. A running job keeps the timeout it started with. `/codex:setup` shows the value and where it comes from.
+
+#### Thread name prefix
+
+```bash
+/codex:setup --thread-prefix "My tasks"
+/codex:setup --thread-prefix unset
+```
+
+Sets the prefix of the Codex threads that `/codex:rescue` (`task`) creates, so they are easy to find in Codex: `My tasks: <name or start of the task>`. The default is `CCT` (earlier releases used `Codex Companion Task`). 1 to 40 characters; stored in the same per-user `config.json` (`threadPrefix`). `CODEX_COMPANION_THREAD_PREFIX`, when set to a valid value, takes precedence. Existing threads keep their names, and `--resume` still finds threads named with an earlier prefix. `/codex:setup` shows the value and where it comes from.
 
 #### Shared runtime lifetime
 

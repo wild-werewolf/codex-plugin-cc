@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Codex rescue subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--approvals <ask|auto-review|deny>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [what Codex should investigate, solve, or continue]"
+argument-hint: "[--background|--wait] [--resume|--fresh] [--approvals <ask|auto-review|deny>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--name <thread name>] [what Codex should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent, Skill
 ---
 
@@ -20,6 +20,7 @@ Execution mode:
 - Do not treat `--background` or `--wait` as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - `--approvals <ask|auto-review|deny>` is a runtime flag too. Preserve it for the forwarded `task` call. Never add it yourself.
+- `--name <thread name>` names the Codex thread (`<prefix>: <name>`; without it the start of the task text is used). It is a runtime flag too: preserve it with its value, quoted, for the forwarded `task` call, keep it out of the task text, and never add or change it yourself.
 - Codex may ask to leave its sandbox. Only background jobs can wait for the user; foreground runs decline such requests and list them under "Approval requests" in the output.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.

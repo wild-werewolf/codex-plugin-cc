@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.6-approvals.8
+
+- Codex task threads are named `CCT: <start of the task>` instead of `Codex Companion Task: ...`. The prefix is configurable: `/codex:setup --thread-prefix <text|unset>` stores it in the per-user `config.json` (`threadPrefix`, 1–40 characters), `CODEX_COMPANION_THREAD_PREFIX` overrides it (an invalid value is ignored and reported by `/codex:setup`). `/codex:setup` shows the prefix and its source (`threadPrefix` in `--json`).
+- `task --name <name>` (and `/codex:rescue --name`) names the thread `<prefix>: <name>` (whitespace collapsed, at most 80 characters; an empty name is an error). With `--resume-last` it renames the resumed thread; without it a resumed thread keeps its name. The name is fixed at launch, stored in the job (`threadName`), shown in the background launch line and as `Codex thread:` in `/codex:status` and `/codex:result`. `/codex:rescue` forwards `--name` as a runtime flag and never adds one itself.
+- `--resume-last` without a job record (no Claude session id) looks for task threads with the current prefix, `CCT` and the old `Codex Companion Task`, and takes the most recently updated.
+
 ## 1.0.6-approvals.7
 
 - Windows: `/codex:cancel` no longer kills the shared broker. A broker started by a background task's worker had that worker as its parent (`ParentProcessId`), so `taskkill /PID <worker> /T /F` also killed the broker, its `codex app-server` and the MCP servers under it, without a shutdown: `broker.json`, `broker.pid` and the `cxc-*` directory stayed behind, and jobs of other sessions on that broker broke. The broker is now started through `scripts/broker-launcher.mjs`, which starts it detached and exits at once; the broker's parent is gone, and no client's tree reaches it. `broker.json` still records the broker's own pid. On macOS and Linux the broker is started directly as before: `detached` puts it in its own session and process group, which `cancel` (`kill(-pid)` of the worker's group) does not reach; a test now checks this on every platform.
