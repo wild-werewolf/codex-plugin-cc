@@ -47,6 +47,14 @@ import { PWSH_PATH_ENV, describeWindowsPowerShell } from "./lib/windows-powershe
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { renderProtocolCheck, runProtocolCheck, summarizeProtocolCheck } from "./lib/protocol-check.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import {
+  THREAD_PREFIX_CONFIG_KEY,
+  THREAD_PREFIX_ENV,
+  DEFAULT_THREAD_PREFIX,
+  normalizeTaskName,
+  normalizeThreadPrefix,
+  resolveThreadPrefix
+} from "./lib/thread-names.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
 import { binaryAvailable, terminateProcessTree, waitForProcessExit } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -110,10 +118,10 @@ function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-approvals <ask|auto-review|deny|unset>] [--approval-timeout <minutes|unset>] [--json]",
+      "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--default-approvals <ask|auto-review|deny|unset>] [--approval-timeout <minutes|unset>] [--thread-prefix <text|unset>] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--approvals <ask|auto-review|deny>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--approvals <ask|auto-review|deny>] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--name <thread name>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -228,6 +236,18 @@ function describeDefaultApprovals() {
   };
 }
 
+function describeThreadPrefix() {
+  const { prefix, source, file, invalidEnv } = resolveThreadPrefix();
+  return {
+    prefix,
+    source,
+    ...(source === "env" ? { env: THREAD_PREFIX_ENV } : {}),
+    ...(file ? { file } : {}),
+    ...(invalidEnv !== undefined ? { invalidEnv, env: THREAD_PREFIX_ENV } : {}),
+    configFile: resolveUserConfigFile()
+  };
+}
+
 function describeApprovalTimeout() {
   const { timeoutMs, source, file } = resolveApprovalTimeout();
   return {
@@ -288,6 +308,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     reviewGateEnabled: Boolean(config.stopReviewGate),
     defaultApprovals: describeDefaultApprovals(),
     approvalTimeout: describeApprovalTimeout(),
+    threadPrefix: describeThreadPrefix(),
     ...(windowsSandbox ? { windowsSandbox } : {}),
     ...(windowsPowerShell ? { windowsPowerShell } : {}),
     protocol,
@@ -298,7 +319,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 
 async function handleSetup(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "default-approvals", "approval-timeout"],
+    valueOptions: ["cwd", "default-approvals", "approval-timeout", "thread-prefix"],
     booleanOptions: ["json", "enable-review-gate", "disable-review-gate"]
   });
 
@@ -316,6 +337,10 @@ async function handleSetup(argv) {
     approvalTimeoutInput === undefined || approvalTimeoutInput === "unset"
       ? null
       : normalizeApprovalTimeoutMinutes(approvalTimeoutInput);
+  const threadPrefixInput = options["thread-prefix"] === undefined ? undefined : String(options["thread-prefix"]);
+  const threadPrefixUnset = threadPrefixInput?.trim().toLowerCase() === "unset";
+  const threadPrefix =
+    threadPrefixInput === undefined || threadPrefixUnset ? null : normalizeThreadPrefix(threadPrefixInput);
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
@@ -345,6 +370,17 @@ async function handleSetup(argv) {
     actionsTaken.push(
       `Set the approval timeout for all repositories to ${approvalTimeoutMinutes} minute${approvalTimeoutMinutes === 1 ? "" : "s"}.` +
         (process.env[APPROVAL_TIMEOUT_ENV] ? ` ${APPROVAL_TIMEOUT_ENV} is set and still takes precedence.` : "")
+    );
+  }
+
+  if (threadPrefixUnset) {
+    setUserConfigValue(THREAD_PREFIX_CONFIG_KEY, undefined);
+    actionsTaken.push(`Removed the thread name prefix setting; new task threads are named "${DEFAULT_THREAD_PREFIX}: ...".`);
+  } else if (threadPrefix !== null) {
+    setUserConfigValue(THREAD_PREFIX_CONFIG_KEY, threadPrefix);
+    actionsTaken.push(
+      `Set the thread name prefix for all repositories to "${threadPrefix}"; new task threads are named "${threadPrefix}: ...".` +
+        (process.env[THREAD_PREFIX_ENV] ? ` ${THREAD_PREFIX_ENV} is set and still takes precedence.` : "")
     );
   }
 
@@ -637,7 +673,13 @@ async function executeTaskRun(request) {
     serverRequestHandler,
     onProgress: holdAwaitingApprovalPhase(request.onProgress, serverRequestHandler),
     persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
+    // Requests queued by an earlier release carry no threadName.
+    threadName:
+      "threadName" in request
+        ? request.threadName
+        : resumeThreadId
+          ? null
+          : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
@@ -703,7 +745,8 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /codex:status ${payload.jobId} for progress.\n`;
+  const thread = payload.threadName ? ` (Codex thread "${payload.threadName}")` : "";
+  return `${payload.title} started in the background as ${payload.jobId}${thread}. Check /codex:status ${payload.jobId} for progress.\n`;
 }
 
 function getJobKindLabel(kind, jobClass) {
@@ -713,7 +756,7 @@ function getJobKindLabel(kind, jobClass) {
   return jobClass === "review" ? "review" : "rescue";
 }
 
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, threadName = null }) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -722,7 +765,8 @@ function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summ
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    ...(threadName ? { threadName } : {})
   });
 }
 
@@ -738,7 +782,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, threadName = null) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -746,11 +790,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    threadName
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, approvalMode, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, approvalMode, resumeLast, threadName = null, jobId }) {
   return {
     cwd,
     model,
@@ -759,8 +804,21 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, approvalMode, res
     write,
     approvalMode,
     resumeLast,
+    threadName,
     jobId
   };
+}
+
+/**
+ * The Codex thread name a task sets, fixed when the task is launched: a new
+ * thread gets "<prefix>: <--name or start of the prompt>"; a resumed thread
+ * keeps its name unless --name gives a new one (null).
+ */
+function resolveTaskThreadName({ prompt, name, resumeLast }) {
+  if (resumeLast) {
+    return name ? buildPersistentTaskThreadName("", { name }) : null;
+  }
+  return buildPersistentTaskThreadName(prompt || DEFAULT_CONTINUE_PROMPT, { name });
 }
 
 function renderTransferResult(payload) {
@@ -853,6 +911,7 @@ function enqueueBackgroundTask(cwd, job, request) {
       status: "queued",
       title: job.title,
       summary: job.summary,
+      ...(job.threadName ? { threadName: job.threadName } : {}),
       logFile
     },
     logFile
@@ -914,7 +973,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "approvals"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "approvals", "name"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -939,12 +998,17 @@ async function handleTask(argv) {
     prompt,
     resumeLast
   });
+  const threadName = resolveTaskThreadName({
+    prompt,
+    name: options.name === undefined ? null : normalizeTaskName(options.name),
+    resumeLast
+  });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, threadName);
     const request = buildTaskRequest({
       cwd,
       model,
@@ -953,6 +1017,7 @@ async function handleTask(argv) {
       write,
       approvalMode,
       resumeLast,
+      threadName,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -960,7 +1025,7 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, threadName);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -972,6 +1037,7 @@ async function handleTask(argv) {
         write,
         approvalMode,
         resumeLast,
+        threadName,
         jobId: job.id,
         onProgress: progress
       }),

@@ -233,9 +233,11 @@ test("setup command can offer Codex install and still points users to codex logi
 
   assert.match(
     setup,
-    /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--default-approvals ask\|auto-review\|deny\|unset\] \[--approval-timeout <minutes>\|unset\]'/
+    /argument-hint:\s*'\[--enable-review-gate\|--disable-review-gate\] \[--default-approvals ask\|auto-review\|deny\|unset\] \[--approval-timeout <minutes>\|unset\] \[--thread-prefix <text>\|unset\]'/
   );
   assert.match(setup, /`approvalTimeout`/);
+  assert.match(setup, /`threadPrefix`/);
+  assert.match(setup, /CODEX_COMPANION_THREAD_PREFIX/);
   assert.match(setup, /AskUserQuestion/);
   assert.match(setup, /npm install -g @openai\/codex/);
   assert.match(setup, /codex-companion\.mjs" setup --json \$ARGUMENTS/);
@@ -243,4 +245,20 @@ test("setup command can offer Codex install and still points users to codex logi
   assert.match(readme, /offer to install Codex for you/i);
   assert.match(readme, /\/codex:setup --enable-review-gate/);
   assert.match(readme, /\/codex:setup --disable-review-gate/);
+});
+
+test("rescue keeps a user --name and otherwise lets the subagent name a fresh thread", () => {
+  const rescue = read("commands/rescue.md");
+  const agent = read("agents/codex-rescue.md");
+  const runtime = read("skills/codex-cli-runtime/SKILL.md");
+  assert.match(rescue, /argument-hint:.*\[--name <thread name>\]/);
+  assert.match(rescue, /the user's name always wins/);
+  assert.match(rescue, /When the user gave none, do not add one here: the subagent names a fresh thread itself/);
+  for (const text of [agent, runtime]) {
+    assert.match(text, /If the user gave no `--name` and this is a fresh run \(no `--resume-last`\), add `--name "<short name>"` yourself/);
+    assert.match(text, /2 to 6 words .* in the language of the user's request/);
+    assert.match(text, /On `--resume-last` add no name/);
+  }
+  assert.match(agent, /when the user gave it, forward it to `task` unchanged \(quote the value\), never change it/);
+  assert.match(runtime, /If the forwarded request includes `--name <thread name>`, pass it through to `task` unchanged/);
 });

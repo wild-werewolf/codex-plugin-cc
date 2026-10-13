@@ -44,9 +44,9 @@ import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from 
 import { buildApprovalRoutingParams } from "./approvals.mjs";
 import { loadBrokerSession, resolveBrokerIdleMs } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
+import { buildTaskThreadName, isTaskThreadName, taskThreadPrefixes } from "./thread-names.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
-const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
@@ -168,11 +168,6 @@ function looksLikeVerificationCommand(command) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     command
   );
-}
-
-function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
-  return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
 function extractThreadId(message) {
@@ -797,21 +792,25 @@ async function requestExternalAgentSessionImport(client, params) {
   }
 }
 
+async function setThreadName(client, threadId, name) {
+  try {
+    await client.request("thread/name/set", { threadId, name });
+  } catch (err) {
+    // Only suppress "unknown variant/method" errors from older CLI versions
+    // that don't support thread/name/set. Rethrow auth, network, or server errors.
+    const msg = String(err?.message ?? err ?? "");
+    if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
+      throw err;
+    }
+  }
+}
+
 async function startThread(client, cwd, options = {}) {
   const response = await client.request("thread/start", buildThreadParams(cwd, options));
   assertThreadPermissions(response, options);
   const threadId = response.thread.id;
   if (options.threadName) {
-    try {
-      await client.request("thread/name/set", { threadId, name: options.threadName });
-    } catch (err) {
-      // Only suppress "unknown variant/method" errors from older CLI versions
-      // that don't support thread/name/set. Rethrow auth, network, or server errors.
-      const msg = String(err?.message ?? err ?? "");
-      if (!msg.includes("unknown variant") && !msg.includes("unknown method")) {
-        throw err;
-      }
-    }
+    await setThreadName(client, threadId, options.threadName);
   }
   return response;
 }
@@ -1194,6 +1193,10 @@ export async function runAppServerTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       threadResponse = await resumeThread(client, options.resumeThreadId, cwd, permissionOptions);
       threadId = threadResponse.thread.id;
+      // A resumed thread keeps its name unless the caller gives a new one.
+      if (options.threadName) {
+        await setThreadName(client, threadId, options.threadName);
+      }
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       threadResponse = await startThread(client, cwd, {
@@ -1243,24 +1246,40 @@ export async function findLatestTaskThread(cwd) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
+  // Threads named with the current prefix, the default one or that of an
+  // earlier release ("Codex Companion Task"): the most recently updated wins.
+  const prefixes = taskThreadPrefixes();
   return withAppServer(cwd, async (client) => {
-    const response = await client.request("thread/list", {
-      cwd,
-      limit: 20,
-      sortKey: "updated_at",
-      sourceKinds: ["appServer"],
-      searchTerm: TASK_THREAD_PREFIX
-    });
-
-    return (
-      response.data.find((thread) => typeof thread.name === "string" && thread.name.startsWith(TASK_THREAD_PREFIX)) ??
-      null
-    );
+    const found = new Map();
+    for (const prefix of prefixes) {
+      const response = await client.request("thread/list", {
+        cwd,
+        limit: 20,
+        sortKey: "updated_at",
+        sourceKinds: ["appServer"],
+        searchTerm: prefix
+      });
+      for (const thread of response.data ?? []) {
+        if (isTaskThreadName(thread.name, prefixes) && !found.has(thread.id)) {
+          found.set(thread.id, thread);
+        }
+      }
+    }
+    return [...found.values()].sort((left, right) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0))[0] ?? null;
   });
 }
 
-export function buildPersistentTaskThreadName(prompt) {
-  return buildTaskThreadName(prompt);
+/**
+ * The name of a new task thread: "<prefix>: <name>" with `name`, else
+ * "<prefix>: <start of the prompt>". The prefix is resolved from the
+ * environment and the user config unless given.
+ */
+export function buildPersistentTaskThreadName(prompt, options = {}) {
+  return buildTaskThreadName({
+    prompt,
+    name: options.name ?? null,
+    ...(options.prefix ? { prefix: options.prefix } : {})
+  });
 }
 
 export function parseStructuredOutput(rawOutput, fallback = {}) {
@@ -1299,6 +1318,5 @@ export {
   buildResumeParams,
   buildThreadParams,
   buildTurnStartParams,
-  DEFAULT_CONTINUE_PROMPT,
-  TASK_THREAD_PREFIX
+  DEFAULT_CONTINUE_PROMPT
 };

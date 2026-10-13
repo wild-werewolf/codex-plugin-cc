@@ -128,6 +128,9 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
+  if (job.threadName) {
+    lines.push(`  Codex thread: ${job.threadName}`);
+  }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
@@ -213,6 +216,20 @@ function renderWindowsPowerShellLine(windowsPowerShell) {
   );
 }
 
+function renderThreadPrefixLine(threadPrefix) {
+  const invalid = threadPrefix.invalidEnv !== undefined
+    ? `; ignoring ${threadPrefix.env}=${JSON.stringify(threadPrefix.invalidEnv)} (not 1 to 40 characters)`
+    : "";
+  switch (threadPrefix.source) {
+    case "env":
+      return `- thread prefix: "${threadPrefix.prefix}" (from ${threadPrefix.env}, which overrides \`--thread-prefix\`)`;
+    case "plugin-default":
+      return `- thread prefix: "${threadPrefix.prefix}" (plugin setting from ${threadPrefix.file}${invalid})`;
+    default:
+      return `- thread prefix: "${threadPrefix.prefix}" (default; change it with \`/codex:setup --thread-prefix <text>\`${invalid})`;
+  }
+}
+
 function renderApprovalTimeoutLine(approvalTimeout) {
   const value = Number.isInteger(approvalTimeout.minutes)
     ? `${approvalTimeout.minutes} minute${approvalTimeout.minutes === 1 ? "" : "s"}`
@@ -250,6 +267,7 @@ export function renderSetupReport(report) {
         ]
       : []),
     ...(report.approvalTimeout ? [renderApprovalTimeoutLine(report.approvalTimeout)] : []),
+    ...(report.threadPrefix ? [renderThreadPrefixLine(report.threadPrefix)] : []),
     ...(report.windowsSandbox ? [renderWindowsSandboxLine(report.windowsSandbox)] : []),
     ...(report.windowsPowerShell ? [renderWindowsPowerShellLine(report.windowsPowerShell)] : []),
     ...(report.protocol ? [`- app-server protocol: ${report.protocol.status}${report.protocol.detail ? ` (${report.protocol.detail})` : ""}`] : []),
@@ -511,12 +529,14 @@ export function renderJobStatusReport(job) {
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `codex resume ${threadId}` : null;
+  const threadName = storedJob?.threadName ?? job.threadName ?? null;
+  const threadNameLine = threadName ? `Codex thread: ${threadName}\n` : "";
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${threadNameLine}`;
   }
 
   const rawOutput =
@@ -528,7 +548,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${threadNameLine}`;
   }
 
   if (storedJob?.rendered) {
@@ -536,7 +556,7 @@ export function renderStoredJobResult(job, storedJob) {
     if (!threadId) {
       return output;
     }
-    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;
+    return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n${threadNameLine}`;
   }
 
   const lines = [
@@ -549,6 +569,9 @@ export function renderStoredJobResult(job, storedJob) {
   if (threadId) {
     lines.push(`Codex session ID: ${threadId}`);
     lines.push(`Resume in Codex: ${resumeCommand}`);
+  }
+  if (threadName) {
+    lines.push(`Codex thread: ${threadName}`);
   }
 
   if (job.summary) {
